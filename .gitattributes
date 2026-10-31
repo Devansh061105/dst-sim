@@ -1,0 +1,2 @@
+# Same line endings (LF) on every OS, so diffs and rustfmt agree between Windows and Linux CI
+* text=auto eol=lf
