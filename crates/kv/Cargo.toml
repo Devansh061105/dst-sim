@@ -1,0 +1,13 @@
+[package]
+name = "kv"
+description = "Linearizable key-value store (get/put/cas) replicated with Raft, plus a retrying client."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sim-api = { workspace = true }
+raft = { workspace = true }
+
+[lints]
+workspace = true

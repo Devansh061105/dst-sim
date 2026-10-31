@@ -1,0 +1,11 @@
+[package]
+name = "checker"
+description = "Linearizability checker (WGL algorithm) over recorded operation histories."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "dst-cli"
+description = "dst command-line tool: run, replay, sweep and shrink simulations."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "dst"
+path = "src/main.rs"
+
+[dependencies]
+sim-api = { workspace = true }
+sim-core = { workspace = true }
+sim-net = { workspace = true }
+sim-disk = { workspace = true }
+checker = { workspace = true }
+raft = { workspace = true }
+kv = { workspace = true }
+
+[lints]
+workspace = true

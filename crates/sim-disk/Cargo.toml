@@ -1,0 +1,12 @@
+[package]
+name = "sim-disk"
+description = "Simulated disk with fault injection: lost unsynced writes on crash, torn writes, fsync errors, corruption."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sim-api = { workspace = true }
+
+[lints]
+workspace = true

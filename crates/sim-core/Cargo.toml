@@ -1,0 +1,14 @@
+[package]
+name = "sim-core"
+description = "Deterministic simulator: seeded RNG streams, virtual clock, event queue, main loop and trace recorder."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sim-api = { workspace = true }
+sim-net = { workspace = true }
+sim-disk = { workspace = true }
+
+[lints]
+workspace = true

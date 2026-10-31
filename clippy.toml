@@ -1,0 +1,16 @@
+# Determinism lint (PROJECT_PLAN feature F22).
+# Anything that makes a run depend on something other than its seed is banned.
+# Crates that legitimately need the real world (dst-cli, runtime-real) opt out
+# with a crate-level `#![allow(clippy::disallowed_methods, clippy::disallowed_types)]`.
+
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "wall-clock time breaks determinism; use ctx.now()" },
+    { path = "std::time::SystemTime::now", reason = "wall-clock time breaks determinism; use ctx.now()" },
+    { path = "std::thread::spawn", reason = "the simulation is single-threaded; thread scheduling is nondeterministic" },
+    { path = "std::thread::sleep", reason = "use ctx.set_timer() so time stays virtual" },
+]
+
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "iteration order is randomised per process; use BTreeMap" },
+    { path = "std::collections::HashSet", reason = "iteration order is randomised per process; use BTreeSet" },
+]

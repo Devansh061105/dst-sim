@@ -1,0 +1,17 @@
+# Build output (large, always regenerable)
+/target/
+
+# Simulation output: traces can be regenerated from their seed, so never commit them
+/traces/
+*.trace.json
+
+# Profiling output
+flamegraph.svg
+perf.data*
+*.profraw
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
