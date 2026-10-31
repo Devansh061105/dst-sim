@@ -4,6 +4,7 @@
 //! implementation of [`Context`]; a real-network runtime can provide another, so the same node code
 //! runs in both.
 
+mod random;
 mod time;
 
 use std::fmt;
@@ -11,6 +12,7 @@ use std::hash::Hash;
 use std::ops::Range;
 use std::time::Duration;
 
+pub use random::Rand;
 pub use time::Time;
 
 /// Identifies a node in the cluster. Nodes are numbered `0..cluster_size`.

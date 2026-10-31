@@ -45,11 +45,11 @@ Wk:  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16
 **Done when:** `cargo test` proves the same seed gives an identical trace and different seeds diverge.
 
 ## Phase 2 — Fault-injecting network and nodes (week 3) → M2
-- [ ] Latency distribution, drop, duplicate, reorder (F4)
-- [ ] Partitions: symmetric, asymmetric, isolate-one, heal (F4)
-- [ ] Node crash and restart, wiping volatile state (F5)
-- [ ] Per-node clock drift and offset (F6)
-- [ ] Gossip toy protocol eventually converges after partitions heal
+- [x] Latency distribution, drop, duplicate, reorder (F4)
+- [x] Partitions: symmetric, asymmetric, isolate-one, heal (F4)
+- [x] Node crash and restart, wiping volatile state (F5)
+- [x] Per-node clock drift and offset (F6)
+- [x] Gossip toy protocol eventually converges after partitions heal
 
 **Done when:** unit tests verify each fault; gossip test passes across 1,000 seeds.
 

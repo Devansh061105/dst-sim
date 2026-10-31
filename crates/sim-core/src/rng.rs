@@ -1,9 +1,6 @@
-use std::ops::Range;
-use std::time::Duration;
-
 use rand_chacha::ChaCha8Rng;
 use rand_chacha::rand_core::{Rng, SeedableRng};
-use sim_api::NodeId;
+use sim_api::{NodeId, Rand};
 
 /// Which part of the simulation a random stream belongs to.
 ///
@@ -13,6 +10,8 @@ use sim_api::NodeId;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stream {
     Network,
+    Faults,
+    Clocks,
     Node(NodeId),
 }
 
@@ -20,6 +19,8 @@ impl Stream {
     fn id(self) -> u64 {
         match self {
             Stream::Network => 0,
+            Stream::Faults => 1,
+            Stream::Clocks => 2,
             Stream::Node(node) => (1 << 32) | u64::from(node.0),
         }
     }
@@ -39,28 +40,18 @@ impl SimRng {
         rng.set_stream(stream.id());
         SimRng(rng)
     }
-
-    pub fn next_u64(&mut self) -> u64 {
-        self.0.next_u64()
-    }
-
-    /// A duration drawn uniformly from `range` (or `range.start` if the range is empty).
-    pub fn duration_in(&mut self, range: Range<Duration>) -> Duration {
-        let lo = nanos(range.start);
-        let hi = nanos(range.end);
-        if hi <= lo {
-            return range.start;
-        }
-        Duration::from_nanos(lo + self.next_u64() % (hi - lo))
-    }
 }
 
-fn nanos(d: Duration) -> u64 {
-    u64::try_from(d.as_nanos()).expect("duration does not fit in u64 nanoseconds")
+impl Rand for SimRng {
+    fn next_u64(&mut self) -> u64 {
+        self.0.next_u64()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn draw(rng: &mut SimRng) -> Vec<u64> {
@@ -78,6 +69,7 @@ mod tests {
     fn streams_and_seeds_are_independent() {
         let base = draw(&mut SimRng::new(7, Stream::Network));
         assert_ne!(base, draw(&mut SimRng::new(8, Stream::Network)));
+        assert_ne!(base, draw(&mut SimRng::new(7, Stream::Faults)));
         assert_ne!(base, draw(&mut SimRng::new(7, Stream::Node(NodeId(0)))));
         assert_ne!(
             draw(&mut SimRng::new(7, Stream::Node(NodeId(0)))),
@@ -94,5 +86,17 @@ mod tests {
         }
         let empty = Duration::from_millis(5)..Duration::from_millis(5);
         assert_eq!(rng.duration_in(empty), Duration::from_millis(5));
+    }
+
+    #[test]
+    fn chance_matches_probability_and_skips_draws_at_extremes() {
+        let mut rng = SimRng::new(3, Stream::Faults);
+        let hits = (0..10_000).filter(|_| rng.chance(0.25)).count();
+        assert!((2_300..2_700).contains(&hits), "{hits} hits for p = 0.25");
+
+        let mut a = SimRng::new(3, Stream::Faults);
+        let mut b = SimRng::new(3, Stream::Faults);
+        assert!(!a.chance(0.0) && a.chance(1.0));
+        assert_eq!(a.next_u64(), b.next_u64(), "p = 0 and p = 1 must not consume randomness");
     }
 }

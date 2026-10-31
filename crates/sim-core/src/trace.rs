@@ -3,6 +3,8 @@ use std::hash::{Hash, Hasher};
 
 use sim_api::{NodeId, Time, TimerId};
 
+use crate::faults::Fault;
+
 /// Record of a run: a running hash of every processed event, plus optional readable lines.
 ///
 /// Two runs with the same hash processed the same events, in the same order, at the same virtual
@@ -47,11 +49,21 @@ impl Trace {
     }
 }
 
+/// Why a message never reached its destination.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DropReason {
+    Lost,
+    Partitioned,
+    NodeDown,
+}
+
 /// One processed event, borrowed from the simulator just long enough to record it.
 pub(crate) enum Entry<'a, M, T> {
     Start { node: NodeId },
     Deliver { from: NodeId, to: NodeId, msg: &'a M },
     Timer { node: NodeId, id: TimerId, timer: &'a T },
+    Fault(&'a Fault),
+    Drop { from: NodeId, to: NodeId, reason: DropReason, msg: &'a M },
 }
 
 impl<M: Hash, T: Hash> Entry<'_, M, T> {
@@ -74,6 +86,17 @@ impl<M: Hash, T: Hash> Entry<'_, M, T> {
                 h.write_u64(id.0);
                 timer.hash(h);
             }
+            Entry::Fault(fault) => {
+                h.write_u8(3);
+                fault.hash_into(h);
+            }
+            Entry::Drop { from, to, reason, msg } => {
+                h.write_u8(4);
+                h.write_u32(from.0);
+                h.write_u32(to.0);
+                h.write_u8(*reason as u8);
+                msg.hash(h);
+            }
         }
     }
 }
@@ -84,6 +107,10 @@ impl<M: fmt::Debug, T: fmt::Debug> fmt::Display for Entry<'_, M, T> {
             Entry::Start { node } => write!(f, "{node} start"),
             Entry::Deliver { from, to, msg } => write!(f, "{to} <- {from} {msg:?}"),
             Entry::Timer { node, timer, .. } => write!(f, "{node} timer {timer:?}"),
+            Entry::Fault(fault) => write!(f, "nemesis {fault}"),
+            Entry::Drop { from, to, reason, msg } => {
+                write!(f, "{to} <-x- {from} {reason:?} {msg:?}")
+            }
         }
     }
 }

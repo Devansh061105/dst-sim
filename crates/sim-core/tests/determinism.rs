@@ -50,6 +50,33 @@ fn different_seeds_different_runs() {
     assert_eq!(hashes.len(), 100);
 }
 
+#[test]
+fn same_seed_same_run_under_chaos() {
+    for seed in 0..100 {
+        let run = || {
+            let config = SimConfig { keep_trace_lines: true, ..SimConfig::chaos(seed, 5) };
+            let mut sim = Simulation::new(config, |_| Gossip::default());
+            let summary = sim.run();
+            (summary, sim.trace().lines().map(<[String]>::to_vec))
+        };
+        assert_eq!(run(), run(), "seed {seed}");
+    }
+}
+
+/// Like the golden test below, but through every fault path: float probabilities, shuffles,
+/// crashes, partitions and drifting clocks must replay bit-for-bit on every platform too.
+#[test]
+fn golden_chaos_hash_is_stable_across_platforms() {
+    const GOLDEN: u64 = 0x026e_78a5_66d3_5866;
+    let mut sim = Simulation::new(SimConfig::chaos(42, 5), |_| Gossip::default());
+    let summary = sim.run();
+    assert_eq!(
+        summary.trace_hash, GOLDEN,
+        "seed 42 chaos trace hash changed: {:#018x}",
+        summary.trace_hash
+    );
+}
+
 /// Pins the exact run for one seed. CI runs this on Linux and Windows, so passing there means a
 /// seed replays bit-for-bit across operating systems. If you change simulator or gossip behaviour
 /// on purpose, update the constant (the failure message prints the new value).
