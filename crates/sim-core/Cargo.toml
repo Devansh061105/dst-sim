@@ -9,6 +9,7 @@ rust-version.workspace = true
 sim-api = { workspace = true }
 sim-net = { workspace = true }
 sim-disk = { workspace = true }
+rand_chacha = { workspace = true }
 
 [lints]
 workspace = true

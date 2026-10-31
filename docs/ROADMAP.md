@@ -25,22 +25,22 @@ Wk:  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16
 
 ## Phase 0 — Setup (week 0, about 3 days)
 - [x] Install Rust (minimal profile, GNU toolchain; see PROJECT_PLAN §6) and VS Code + rust-analyzer
-- [~] `git init`, `.gitignore` done; create GitHub repo pending
+- [x] `git init`, `.gitignore`, create GitHub repo
 - [x] Cargo workspace skeleton with empty crates (`sim-api`, `sim-core`, `sim-net`, `sim-disk`, `checker`, `raft`, `kv`, `dst-cli`)
 - [x] `clippy.toml` determinism lint (F22); `rustfmt.toml`
 - [x] Workspace profile: `debug = "line-tables-only"` to save disk
-- [~] Minimal CI: build + test + clippy on push (written; runs once pushed)
+- [x] Minimal CI: build + test + clippy on push
 
 **Done when:** `cargo test` and `cargo clippy` pass on an empty workspace, locally and in CI.
 
 ## Phase 1 — Simulation core (weeks 1–2) → M1
-- [ ] Seeded RNG with forked per-subsystem streams (F1)
-- [ ] Virtual clock + event queue ordered by `(time, seq)` (F2)
-- [ ] `Node` trait and `Context` API (F3)
-- [ ] Simulator main loop: deliver messages, fire timers, stop at time / step limit
-- [ ] Trace recorder + running trace hash (F11)
-- [ ] Toy protocol: ping-pong and a gossip broadcast
-- [ ] Determinism test: 100 seeds × 2 runs, hashes equal
+- [x] Seeded RNG with forked per-subsystem streams (F1)
+- [x] Virtual clock + event queue ordered by `(time, seq)` (F2)
+- [x] `Node` trait and `Context` API (F3)
+- [x] Simulator main loop: deliver messages, fire timers, stop at time / step limit
+- [x] Trace recorder + running trace hash (F11)
+- [x] Toy protocol: ping-pong and a gossip broadcast
+- [x] Determinism test: 100 seeds × 2 runs, hashes equal
 
 **Done when:** `cargo test` proves the same seed gives an identical trace and different seeds diverge.
 

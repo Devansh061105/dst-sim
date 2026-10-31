@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 
 # Internal crates, referenced by members as `sim-api = { workspace = true }`.
 [workspace.dependencies]
@@ -16,6 +16,9 @@ sim-disk = { path = "crates/sim-disk" }
 checker = { path = "crates/checker" }
 raft = { path = "crates/raft" }
 kv = { path = "crates/kv" }
+
+# External crates (keep this list short: disk space is limited).
+rand_chacha = { version = "0.10", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
