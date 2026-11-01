@@ -24,7 +24,8 @@ use sim_api::{Context, Node, NodeId, TimerId};
 /// Deliberately planted bugs. Each must be caught by the tests; all are off by default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Bugs {
-    /// Any server answers reads from its own copy instead of going through the Raft log.
+    /// Any server answers reads from its own copy at once, instead of only the leader answering
+    /// after confirming it still leads (ReadIndex).
     pub local_reads: bool,
     /// Snapshots hold the store but not the session table, so a server restored from one
     /// applies a retried write a second time.

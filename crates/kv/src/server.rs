@@ -124,7 +124,7 @@ impl Server {
             && let Op::Get { key } = op
         {
             // Bug: answer from this replica's own copy, which may lag behind the leader (or be a
-            // deposed leader's), instead of ordering the read through the log.
+            // deposed leader's), instead of waiting for the ReadIndex confirmation below.
             let value = self.store.get(&key).copied();
             ctx.send(from, KvMsg::Response { id, reply: Reply::Done(OpResult::Value(value)) });
             return;

@@ -36,7 +36,10 @@ A 5-server Raft cluster with 2 clients, release build on 16 threads:
 **Real mode.** The same Raft and store code runs as separate processes over TCP and real files
 (`dst serve`, `dst client`). A test starts three servers and keeps `kill -9`-ing and restarting
 them, one at a time, while a client writes; the client's history then passes the same
-linearizability checker. A 400-operation run survived 99 kills.
+linearizability checker. Each client does 200 operations on a fresh cluster, and clients run one
+after another until at least three kills have landed mid-run, so the test does the same work on a
+fast machine and a slow CI runner. An earlier, longer version (one 400-operation client) survived
+99 kills.
 
 **Speed.** One thread simulates the 7-node cluster (5 servers, 2 clients) about **4,200x faster
 than real time**: 1.3 M events/s, about 670 seeds/s, each seed 6.3 s of simulated time on
