@@ -219,7 +219,7 @@ dst-sim/
 ## 8. Resume bullets (real numbers, measured at the end of Phase 8)
 
 - Built a deterministic simulation testing framework in Rust (10 crates, ~9k lines) that runs a
-  Raft key-value cluster on one thread **~3,900× faster than real time**; any failure replays
+  Raft key-value cluster on one thread **~4,200× faster than real time**; any failure replays
   bit-for-bit from a single 64-bit seed, verified across Linux and Windows in CI.
 - Injected partitions, message loss, duplication and reordering, crashes, clock drift and disk
   faults (torn writes, lost and failed `fsync`, crashes mid-`fsync`, bit flips, misplaced writes);

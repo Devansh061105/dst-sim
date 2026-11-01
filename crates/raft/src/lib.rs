@@ -365,6 +365,10 @@ impl Raft {
     /// Reads registered with [`read_index`](Raft::read_index) that are now decided. Call after
     /// applying [`take_committed`](Raft::take_committed)'s entries.
     pub fn take_reads(&mut self) -> Vec<(u64, ReadOutcome)> {
+        // Called after every event; skip the work below when there is nothing to answer.
+        if self.reads.is_empty() {
+            return Vec::new();
+        }
         let leader = self.role == Role::Leader;
         let term = self.durable.term;
         // (`term_at` is `None` if a planted bug pushed the commit index past the log; the

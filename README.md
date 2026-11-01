@@ -22,7 +22,7 @@ A 5-server Raft cluster with 2 clients, release build on 16 threads:
 |---|---|---|
 | Seeds | 200,000 | 300,000 |
 | Result | **all pass**: no safety or linearizability violation, every client finished | **all pass** |
-| Wall-clock time | 42 s (≈4,800 seeds/s) | 72 s (≈4,100 seeds/s) |
+| Wall-clock time | 43 s (≈4,600 seeds/s) | 76 s (≈3,900 seeds/s) |
 | Simulated time | 349 cluster-hours, 383 M events | 525 cluster-hours, 618 M events |
 | Crashes / self-halts | 386,649 / 1,008,286 | 1,350,576 / 3,229,331 |
 | Partitions | 900,167 | 1,823,583 |
@@ -35,9 +35,18 @@ A 5-server Raft cluster with 2 clients, release build on 16 threads:
 them, one at a time, while a client writes; the client's history then passes the same
 linearizability checker. A 400-operation run survived 99 kills.
 
-**Speed.** One thread simulates the 7-node cluster (5 servers, 2 clients) about **3,900x faster
-than real time**: 1.2 M events/s, about 610 seeds/s, each seed 6.3 s of simulated time on
-average. All 16 hardware threads together reach about 30,000x.
+**Speed.** One thread simulates the 7-node cluster (5 servers, 2 clients) about **4,200x faster
+than real time**: 1.3 M events/s, about 670 seeds/s, each seed 6.3 s of simulated time on
+average. All 16 hardware threads together reach about 29,000x.
+
+**Where the time goes.** A CPU flamegraph of a one-thread chaos sweep
+([docs/flamegraph.svg](docs/flamegraph.svg), from the on-demand `Profile` workflow using Linux
+`perf`) splits the time roughly as: 54% in the nodes' own handlers (Raft about 17%, its storage
+encoding and writes 16%), 12% recording and hashing the trace, 10% in the event queue, 8% in the
+Raft invariant checker after every step, and under 1% in the linearizability checker. It also
+showed the store's read path taking 11% of all time while almost never having a read to answer;
+returning early when none are pending made the simulator about 14% faster without changing a
+single trace hash.
 
 Determinism: the same seed gives a bit-identical trace, verified on Linux and Windows in CI. Every
 push runs a 10,000-seed chaos sweep and a 2,000-seed swarm sweep; a nightly job sweeps 200,000

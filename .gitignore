@@ -6,7 +6,7 @@
 *.trace.json
 
 # Profiling output
-flamegraph.svg
+/flamegraph.svg
 perf.data*
 *.profraw
 
