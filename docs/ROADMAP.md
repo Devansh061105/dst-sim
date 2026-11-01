@@ -71,15 +71,15 @@ Wk:  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16
 **Done when:** 10,000 seeds with all Phase 2–3 faults enabled show no invariant violations.
 
 ## Phase 5 — Linearizability checker (week 8) → M5 = MVP ✅
-- [ ] History types: invoke / ok / fail / info (timeout = unknown outcome) (F10)
-- [ ] WGL search with memoisation; per-key partitioning
-- [ ] Unit tests: handcrafted good and bad histories (including Porcupine's examples)
-- [ ] Integrate: every simulation run's history gets checked
-- [ ] First README draft + architecture diagram
+- [x] History types: invoke / ok / fail / info (timeout = unknown outcome) (F10)
+- [x] WGL search with memoisation; per-key partitioning
+- [x] Unit tests: handcrafted good and bad histories (including Porcupine's examples)
+- [x] Integrate: every simulation run's history gets checked
+- [x] First README draft + architecture diagram
 
 **Done when:** a deliberately broken KV (for example, reads served by followers) is flagged non-linearizable within 1,000 seeds, and the correct one passes 10,000.
 
-> **MVP gate:** nothing from Phase 6 starts until M5 is met and committed.
+> **MVP gate:** nothing from Phase 6 starts until M5 is met and committed. **M5 met.**
 
 ## Phase 6 — Bug hunter (weeks 9–10) → M6
 - [ ] `dst` CLI: `run`, `replay`, `sweep --jobs N` with `rayon` (F12)

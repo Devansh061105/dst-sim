@@ -70,3 +70,25 @@ fn same_seed_same_run() {
         assert_eq!((a.trace_hash, a.stats), (b.trace_hash, b.stats), "seed {seed}");
     }
 }
+
+/// The M5 "done when": a store that answers reads from a replica's own copy is caught by the
+/// linearizability checker, while Raft's own invariants stay green (the log is fine; the reads
+/// are not).
+#[test]
+fn stale_local_reads_are_caught() {
+    let bugs = kv::Bugs { local_reads: true };
+    let caught = (0..1000).find(|&seed| {
+        let outcome = common::run_with_bugs(SimConfig::chaos(seed, NODES), SERVERS, OPS, bugs);
+        assert!(outcome.violation.is_none(), "seed {seed}: Raft itself should stay safe");
+        matches!(outcome.verdict, checker::Verdict::NotLinearizable { .. })
+    });
+    let seed = caught.expect("stale local reads went undetected for 1,000 seeds");
+    println!("stale local reads caught at seed {seed}");
+}
+
+#[test]
+fn histories_are_recorded_and_complete_without_faults() {
+    let outcome = run(SimConfig::new(3, NODES), SERVERS, OPS);
+    outcome.assert_healthy();
+    assert_eq!(outcome.operations, (2 * OPS) as usize, "every invocation is in the history");
+}

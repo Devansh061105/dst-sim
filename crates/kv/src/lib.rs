@@ -8,13 +8,22 @@
 
 mod client;
 mod command;
+mod model;
 mod server;
 
 pub use client::{Client, ClientEvent};
 pub use command::{Op, OpResult, RequestId};
+pub use model::{KvModel, Recorder};
 use raft::{RaftMsg, RaftTimer};
 pub use server::Server;
 use sim_api::{Context, Node, NodeId, TimerId};
+
+/// Deliberately planted bugs. Each must be caught by the tests; all are off by default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bugs {
+    /// Any server answers reads from its own copy instead of going through the Raft log.
+    pub local_reads: bool,
+}
 
 #[derive(Clone, Debug, Hash)]
 pub enum KvMsg {
@@ -71,10 +80,19 @@ impl KvNode {
 /// Node factory for a cluster of `servers` servers (ids `0..servers`); every other node id is a
 /// client that performs `ops_per_client` operations.
 pub fn cluster(servers: u32, ops_per_client: u32) -> impl FnMut(NodeId) -> KvNode + 'static {
+    cluster_with_bugs(servers, ops_per_client, Bugs::default())
+}
+
+/// Like [`cluster`], with planted bugs in every server.
+pub fn cluster_with_bugs(
+    servers: u32,
+    ops_per_client: u32,
+    bugs: Bugs,
+) -> impl FnMut(NodeId) -> KvNode + 'static {
     let members: Vec<NodeId> = (0..servers).map(NodeId).collect();
     move |id| {
         if id.0 < servers {
-            KvNode::Server(Server::new(id, members.clone()))
+            KvNode::Server(Server::with_bugs(id, members.clone(), bugs))
         } else {
             KvNode::Client(Client::new(members.clone(), ops_per_client))
         }

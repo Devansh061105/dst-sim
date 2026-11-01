@@ -4,7 +4,7 @@ use raft::{NotLeader, Raft, RaftConfig, RaftMsg, RaftTimer};
 use sim_api::{NodeId, SubContext, TimerId};
 
 use crate::command::{Command, Op, OpResult, RequestId};
-use crate::{KvContext, KvMsg, KvTimer, Reply};
+use crate::{Bugs, KvContext, KvMsg, KvTimer, Reply};
 
 /// A replica: Raft plus the key-value map it builds by applying committed commands in log order.
 #[derive(Debug)]
@@ -17,6 +17,7 @@ pub struct Server {
     sessions: BTreeMap<u64, (u64, OpResult)>,
     /// Log index → client to answer once that index is applied (only on the proposing leader).
     pending: BTreeMap<u64, (NodeId, RequestId)>,
+    bugs: Bugs,
 }
 
 fn raft_ctx<'a>(ctx: &'a mut KvContext<'_>) -> SubContext<'a, KvMsg, KvTimer, RaftMsg, RaftTimer> {
@@ -25,11 +26,17 @@ fn raft_ctx<'a>(ctx: &'a mut KvContext<'_>) -> SubContext<'a, KvMsg, KvTimer, Ra
 
 impl Server {
     pub fn new(id: NodeId, members: Vec<NodeId>) -> Self {
+        Self::with_bugs(id, members, Bugs::default())
+    }
+
+    /// A server with deliberately planted bugs, for checking that the tests catch them.
+    pub fn with_bugs(id: NodeId, members: Vec<NodeId>, bugs: Bugs) -> Self {
         Server {
             raft: Raft::new(id, RaftConfig::new(members)),
             store: BTreeMap::new(),
             sessions: BTreeMap::new(),
             pending: BTreeMap::new(),
+            bugs,
         }
     }
 
@@ -62,6 +69,15 @@ impl Server {
         id: RequestId,
         op: Op,
     ) {
+        if self.bugs.local_reads
+            && let Op::Get { key } = op
+        {
+            // Bug: answer from this replica's own copy, which may lag behind the leader (or be a
+            // deposed leader's), instead of ordering the read through the log.
+            let value = self.store.get(&key).copied();
+            ctx.send(from, KvMsg::Response { id, reply: Reply::Done(OpResult::Value(value)) });
+            return;
+        }
         match self.sessions.get(&id.session) {
             // Already applied: answer from the cache.
             Some((seq, result)) if *seq == id.seq => {

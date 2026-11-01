@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 sim-api = { workspace = true }
 raft = { workspace = true }
+checker = { workspace = true }
 
 [lints]
 workspace = true

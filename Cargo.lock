@@ -23,6 +23,7 @@ dependencies = [
 name = "kv"
 version = "0.1.0"
 dependencies = [
+ "checker",
  "raft",
  "sim-api",
  "sim-core",
