@@ -75,12 +75,24 @@ mean number of seeds needed to catch it, measured over 10,000 seeds per bug with
 | The leader serves reads without confirming it still leads | 769 | 1 in 10,000 | linearizability |
 | Follower commits past the entries a message verified (a Figure 2 subtlety) | not yet | 2,000 | Raft invariants |
 | Vote kept in memory but not persisted | not yet | 1 in 10,000 | Raft invariants |
-| Leader commits earlier-term entries by counting replicas (Figure 8) | not yet | not yet | — |
-| Truncate and append share one `fsync` | not yet | not yet | — |
+| Leader commits earlier-term entries by counting replicas (Figure 8) | not yet | not yet | Raft invariants, targeted scenario |
+| Truncate and append share one `fsync` | not yet | not yet | Raft invariants, targeted scenario |
 
 The rare ones need a precise sequence: a deposed leader still serving a read after a new leader
 took a write, a vote request re-delivered after the voter restarted, Figure 8 of the Raft paper.
-Swarm and chaos complement each other; targeted scenarios for the last two are future work.
+Swarm and chaos complement each other. The last two never showed up in random runs, so each has
+a **targeted scenario**: a test drives a five-server cluster through the exact sequence with
+injected crashes and restarts, the safety checker running after every step, and catches the bug
+on every seed while correct Raft passes (`cargo test -p harness --test cluster`).
+- *Figure 8*: a new leader's no-op normally travels with the old entries and commits them
+  safely. The window opens when the leader has more old-term entries than fit in one
+  AppendEntries: a majority acknowledges a batch that is entirely from an old term, and the
+  buggy leader commits it. A server holding a newer, conflicting entry then wins an election
+  without that batch (Leader Completeness fails).
+- *Shared `fsync`*: a follower replaces a stale tail and dies inside the one `fsync` covering both
+  the truncate and the append, with the append on disk and the truncate not. After the restart
+  its log is the new entry followed by the stale tail (Log Matching fails). With the truncate
+  synced on its own, the same crash changes nothing on disk.
 
 **The corruption defence is necessary.** With the per-node check relaxed, trusting a damaged log
 leads to real cluster-wide failures (a leader elected without an already committed entry, in 14

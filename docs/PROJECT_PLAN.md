@@ -225,8 +225,9 @@ dst-sim/
   faults (torn writes, lost and failed `fsync`, crashes mid-`fsync`, bit flips, misplaced writes);
   checked all five Raft safety properties after every step and client histories with a custom
   linearizability checker (WGL search).
-- Caught **9 of 11 planted consensus and storage bugs**, the common ones in a mean of **1–26
-  seeds**; a delta-debugging shrinker cuts failing fault schedules **3× at the median**, viewed as
+- Caught **all 11 planted consensus and storage bugs**: 9 by random fault search (the common
+  ones in a mean of **1–26 seeds**) and the 2 that random faults never reach (Raft's Figure 8, a
+  crash inside a shared `fsync`) by targeted step-by-step scenarios; a delta-debugging shrinker cuts failing fault schedules **3× at the median**, viewed as
   space-time diagrams in a self-contained HTML trace viewer.
 - Found and fixed **16 real bugs and test gaps** in my own Raft, storage, simulator and
   checkers, one as rare as 1 in 300,000 seeds; **874 simulated cluster-hours** (500,000 seeds)
