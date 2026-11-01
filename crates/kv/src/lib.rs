@@ -31,6 +31,8 @@ pub struct Bugs {
     pub raft: raft::Bugs,
 }
 
+/// Everything sent between nodes: Raft traffic between servers, requests and replies
+/// between clients and servers.
 #[derive(Clone, Debug, Hash)]
 pub enum KvMsg {
     Raft(RaftMsg),
@@ -38,6 +40,7 @@ pub enum KvMsg {
     Response { id: RequestId, reply: Reply },
 }
 
+/// A server's answer to a request.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum Reply {
     Done(OpResult),
@@ -45,12 +48,14 @@ pub enum Reply {
     NotLeader(Option<NodeId>),
 }
 
+/// Timers: Raft's own, and a client's retry timer.
 #[derive(Clone, Debug, Hash)]
 pub enum KvTimer {
     Raft(RaftTimer),
     Retry,
 }
 
+/// The host context a key-value node runs in.
 pub type KvContext<'a> = dyn Context<KvMsg, KvTimer> + 'a;
 
 /// One node of a cluster. The simulator runs a single node type, so servers and clients share it.

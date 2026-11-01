@@ -112,6 +112,8 @@ impl Checker {
         Self::default()
     }
 
+    /// Checks the servers' current state, and how it changed since the last call, against
+    /// every property. Call it after every simulation step.
     pub fn check<'a>(
         &mut self,
         nodes: impl IntoIterator<Item = &'a Raft>,

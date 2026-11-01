@@ -12,6 +12,8 @@ use std::collections::BTreeMap;
 
 use sim_api::{Rand, Storage, SyncError};
 
+/// How unreliable a disk is. All probabilities default to 0: a strict disk that keeps
+/// exactly what was synced.
 #[derive(Clone, Debug, Default)]
 pub struct DiskConfig {
     /// On a crash, the probability that each unsynced operation reached the disk anyway.
@@ -60,6 +62,7 @@ pub struct Corruption {
     pub kind: CorruptionKind,
 }
 
+/// How data at rest was damaged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CorruptionKind {
     /// One bit of the byte at `offset` flipped.
@@ -77,6 +80,8 @@ pub struct SyncFailure {
     pub dropped: u64,
 }
 
+/// One node's disk, with page-cache semantics: writes are visible at once but survive a
+/// crash only once synced.
 #[derive(Clone, Debug)]
 pub struct Disk {
     config: DiskConfig,
@@ -96,6 +101,7 @@ impl Disk {
         Disk { config, files: BTreeMap::new(), sync_failures: Vec::new(), crashed_in_sync: false }
     }
 
+    /// What a process sees now, synced or not.
     pub fn read(&self, file: &str) -> &[u8] {
         self.files.get(file).map_or(&[], |f| &f.visible)
     }
@@ -105,6 +111,7 @@ impl Disk {
         self.files.get(file).map_or(&[], |f| &f.durable)
     }
 
+    /// Writes into the page cache; durable after the next successful [`Disk::sync`].
     pub fn write(&mut self, file: &str, offset: u64, data: &[u8]) {
         let op = Op::Write { offset, data: data.to_vec() };
         let f = self.files.entry(file.to_owned()).or_default();
@@ -112,6 +119,7 @@ impl Disk {
         f.pending.push(op);
     }
 
+    /// Truncates in the page cache; durable after the next successful [`Disk::sync`].
     pub fn truncate(&mut self, file: &str, len: u64) {
         let op = Op::Truncate { len };
         let f = self.files.entry(file.to_owned()).or_default();

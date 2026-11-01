@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use sim_api::{NodeId, Rand};
 
+/// How unreliable the network is. Probabilities are per message.
 #[derive(Clone, Debug)]
 pub struct NetConfig {
     /// Normal one-way delay, drawn uniformly. Messages sent close together with different delays
@@ -25,6 +26,7 @@ pub struct NetConfig {
     /// Probability that a message hits a delay spike (congestion, a stalled machine), which
     /// reorders it far behind messages sent after it.
     pub spike: f64,
+    /// Delay of a message that hits a spike.
     pub spike_latency: Range<Duration>,
 }
 
@@ -50,6 +52,7 @@ pub enum Route {
     Partitioned,
 }
 
+/// The network's fault model: decides what happens to each message when it is sent.
 #[derive(Clone, Debug)]
 pub struct Network {
     config: NetConfig,

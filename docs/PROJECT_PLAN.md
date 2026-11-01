@@ -216,15 +216,22 @@ dst-sim/
 
 ---
 
-## 8. Resume bullets (fill in real numbers at the end)
+## 8. Resume bullets (real numbers, measured at the end of Phase 8)
 
-- Built a deterministic simulation testing framework in Rust that runs a 5-node Raft cluster on a
-  single thread at **N× real time**, reproducing any failure from a single 64-bit seed.
-- Injected network partitions, clock drift, node crashes and disk faults (torn writes, lost fsync,
-  bit flips); verified correctness with a custom linearizability checker (WGL algorithm).
-- Caught **6/6 planted consensus bugs** in a mean of **N seeds**; automatic delta-debugging shrank
-  failing traces by **N×** to minimal reproductions, visualised as space-time diagrams.
-- Ran **N simulated cluster-hours** per nightly CI sweep across all cores with `rayon`.
+- Built a deterministic simulation testing framework in Rust (10 crates, ~9k lines) that runs a
+  Raft key-value cluster on one thread **~3,900× faster than real time**; any failure replays
+  bit-for-bit from a single 64-bit seed, verified across Linux and Windows in CI.
+- Injected partitions, message loss, duplication and reordering, crashes, clock drift and disk
+  faults (torn writes, lost and failed `fsync`, crashes mid-`fsync`, bit flips, misplaced writes);
+  checked all five Raft safety properties after every step and client histories with a custom
+  linearizability checker (WGL search).
+- Caught **9 of 11 planted consensus and storage bugs**, the common ones in a mean of **1–26
+  seeds**; a delta-debugging shrinker cuts failing fault schedules **3× at the median**, viewed as
+  space-time diagrams in a self-contained HTML trace viewer.
+- Found and fixed **16 real bugs and test gaps** in my own Raft, storage, simulator and
+  checkers, one as rare as 1 in 300,000 seeds; **874 simulated cluster-hours** (500,000 seeds)
+  pass in under two minutes on 16 threads, and the same code survives repeated `kill -9` as real
+  processes over TCP.
 
 ---
 

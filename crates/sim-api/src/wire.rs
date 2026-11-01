@@ -55,14 +55,17 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Appends `v`, little-endian.
 pub fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend(v.to_le_bytes());
 }
 
+/// Appends `v`, little-endian.
 pub fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend(v.to_le_bytes());
 }
 
+/// Appends a length-prefixed byte string (read back with [`Reader::bytes`]).
 pub fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     put_u64(out, bytes.len() as u64);
     out.extend(bytes);

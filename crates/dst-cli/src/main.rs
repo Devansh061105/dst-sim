@@ -210,10 +210,10 @@ fn shrink_seed(start: &Scenario, out: &Path) -> ExitCode {
         println!("  {step}");
     }
     // With fewer faults a failure can take longer to show, so the run may not get shorter.
-    let size = if shrunk.ratio() > 1.0 {
-        format!("{:.1}x fewer", shrunk.ratio())
-    } else {
-        "the failure now takes longer to show".to_owned()
+    let size = match shrunk.events.cmp(&shrunk.original_events) {
+        std::cmp::Ordering::Less => format!("{:.1}x fewer", shrunk.ratio()),
+        std::cmp::Ordering::Equal => "same length".to_owned(),
+        std::cmp::Ordering::Greater => "the failure now takes longer to show".to_owned(),
     };
     println!(
         "shrunk in {:.1} s ({} simulations): {} faults -> {}, {} events -> {} ({size})",
@@ -256,28 +256,42 @@ fn describe(s: &Scenario) -> String {
 
 fn sweep(seeds: Range<u64>, mode: Mode, bug: Option<Bug>, failures_path: &PathBuf) -> ExitCode {
     let started = Instant::now();
-    let results: Vec<(u64, Option<String>, Stats)> = seeds
+    let results: Vec<(u64, Option<String>, Stats, u64, u64)> = seeds
         .clone()
         .into_par_iter()
         .map(|seed| {
             let outcome = run_seed(mode, seed, bug, false);
-            (seed, outcome.failure(), outcome.stats)
+            (seed, outcome.failure(), outcome.stats, outcome.end_time.as_nanos(), outcome.events)
         })
         .collect();
-    let elapsed = started.elapsed().as_secs_f64();
+    let elapsed = started.elapsed().as_secs_f64().max(1e-9);
 
     let mut total = Stats::default();
-    for (_, _, stats) in &results {
+    let (mut simulated_ns, mut events) = (0u64, 0u64);
+    for (_, _, stats, end, n) in &results {
         total += *stats;
+        simulated_ns += end;
+        events += n;
     }
     let failures: Vec<_> =
-        results.iter().filter_map(|(s, f, _)| f.as_ref().map(|f| (*s, f))).collect();
+        results.iter().filter_map(|(s, f, ..)| f.as_ref().map(|f| (*s, f))).collect();
     let count = seeds.end.saturating_sub(seeds.start);
+    let threads = rayon::current_num_threads();
     println!(
-        "{count} seeds ({mode}{}) in {elapsed:.1} s on {} threads: {:.0} seeds/s",
+        "{count} seeds ({mode}{}) in {elapsed:.1} s on {threads} threads: {:.0} seeds/s",
         bug.map(|b| format!(", bug {b}")).unwrap_or_default(),
-        rayon::current_num_threads(),
-        count as f64 / elapsed.max(1e-9),
+        count as f64 / elapsed,
+    );
+    // Each seed simulates a whole cluster, so simulated time adds up across seeds.
+    let simulated = simulated_ns as f64 / 1e9;
+    println!(
+        "simulated {:.1} cluster-hours ({:.1} s per seed), {events} events: {:.0}x real time on \
+         {threads} threads, {:.0}x per thread, {:.2} M events/s",
+        simulated / 3600.0,
+        simulated / count as f64,
+        simulated / elapsed,
+        simulated / elapsed / threads as f64,
+        events as f64 / elapsed / 1e6,
     );
     println!("{}", faults(&total));
 

@@ -16,10 +16,14 @@ use std::fmt::Debug;
 
 /// The sequential specification a history is checked against.
 pub trait Model {
+    /// The object's state. `Ord` so visited states can be memoised.
     type State: Clone + Ord + Debug;
+    /// An operation as invoked.
     type Input: Clone + Debug;
+    /// What an operation returned.
     type Output: Clone + PartialEq + Debug;
 
+    /// The state before any operation.
     fn init(&self) -> Self::State;
 
     /// Runs `input` against `state` as a single machine would.
@@ -41,6 +45,7 @@ pub struct Operation<I, O> {
     pub ret: Option<(u64, O)>,
 }
 
+/// Names an invoked operation so its response can be recorded later.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OpId(usize);
 
@@ -85,6 +90,7 @@ impl<I, O> History<I, O> {
     }
 }
 
+/// The result of [`check`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Linearizable,

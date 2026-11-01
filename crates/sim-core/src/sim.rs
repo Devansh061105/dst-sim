@@ -195,6 +195,7 @@ impl std::ops::AddAssign for Stats {
     }
 }
 
+/// How a run ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunSummary {
     pub stop: StopReason,

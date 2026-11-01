@@ -99,12 +99,12 @@ Wk:  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16
 **Done when:** `dst shrink --seed X` outputs a minimal trace that opens in the viewer; real-mode demo is recorded as a GIF. **M7 met.**
 
 ## Phase 8 — Polish and ship (weeks 14–15) → M8
-- [ ] Measure and fill in all metrics (PROJECT_PLAN §5); flamegraph
-- [ ] README: pitch, diagram, viewer screenshot, metrics table, quick start, "how determinism works"
-- [ ] `docs/BUG_MUSEUM.md`: every real bug found in my own Raft, with seed, trace and fix
-- [ ] Nightly CI sweep; Linux + Windows matrix
-- [ ] Optional blog post; resume bullets with real numbers; interview talking points
-- [ ] Code cleanup, doc comments, `cargo doc`
+- [~] Measure and fill in all metrics (PROJECT_PLAN §5); flamegraph (workflow ready, first run after push)
+- [x] README: pitch, diagram, viewer screenshot, metrics table, quick start, "how determinism works"
+- [x] `docs/BUG_MUSEUM.md`: every real bug found in my own Raft, with seed, trace and fix
+- [x] Nightly CI sweep; Linux + Windows matrix
+- [x] Resume bullets with real numbers; interview talking points (blog post: optional, not written)
+- [x] Code cleanup, doc comments, `cargo doc` (warnings are errors in CI)
 
 ## Week 16 — Buffer
 Slack for exams, placements and Raft debugging. If unused, start Tier 3 (F24–F28).

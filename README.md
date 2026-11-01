@@ -10,9 +10,9 @@ safety properties and, at the end, for linearizability. A failing run shrinks to
 scenario that opens in a trace viewer, and the same Raft code also runs as real processes over
 TCP.
 
-> **Status:** milestones M1–M7 complete (simulator, faults, Raft KV, linearizability checking,
-> bug-hunting CLI, shrinking, trace viewer, disk corruption, ReadIndex, snapshots, real mode).
-> Next: polish and measurements. See [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Status:** complete through milestone M8 (simulator, faults, Raft KV, linearizability
+> checking, bug-hunting CLI, shrinking, trace viewer, disk corruption, ReadIndex, snapshots, real
+> mode). See [docs/ROADMAP.md](docs/ROADMAP.md) and the [bug museum](docs/BUG_MUSEUM.md).
 
 ## Results
 
@@ -22,7 +22,8 @@ A 5-server Raft cluster with 2 clients, release build on 16 threads:
 |---|---|---|
 | Seeds | 200,000 | 300,000 |
 | Result | **all pass**: no safety or linearizability violation, every client finished | **all pass** |
-| Wall-clock time | 35 s (≈5,700 seeds/s) | 59 s (≈5,100 seeds/s) |
+| Wall-clock time | 42 s (≈4,800 seeds/s) | 72 s (≈4,100 seeds/s) |
+| Simulated time | 349 cluster-hours, 383 M events | 525 cluster-hours, 618 M events |
 | Crashes / self-halts | 386,649 / 1,008,286 | 1,350,576 / 3,229,331 |
 | Partitions | 900,167 | 1,823,583 |
 | Lost / duplicated messages | 15.8 M / 6.0 M | 22.8 M / 20.5 M |
@@ -34,9 +35,13 @@ A 5-server Raft cluster with 2 clients, release build on 16 threads:
 them, one at a time, while a client writes; the client's history then passes the same
 linearizability checker. A 400-operation run survived 99 kills.
 
+**Speed.** One thread simulates the 7-node cluster (5 servers, 2 clients) about **3,900x faster
+than real time**: 1.2 M events/s, about 610 seeds/s, each seed 6.3 s of simulated time on
+average. All 16 hardware threads together reach about 30,000x.
+
 Determinism: the same seed gives a bit-identical trace, verified on Linux and Windows in CI. Every
 push runs a 10,000-seed chaos sweep and a 2,000-seed swarm sweep; a nightly job sweeps 200,000
-swarm seeds it has never run before.
+swarm seeds it has never run before (about 350 simulated cluster-hours).
 
 ![Trace viewer showing a shrunk failure](docs/viewer.png)
 
@@ -75,18 +80,19 @@ of 20,000 swarm seeds and 4 of 20,000 chaos seeds), while the correct code passe
 **Durability bugs** in a toy write-ahead log: acknowledging before `fsync` (< 20 seeds) and
 trusting a retried `fsync` after a failure ("fsyncgate", PostgreSQL 2018; < 300 seeds).
 
-**Found while building it** (each fixed, with a regression test):
-- A restarted node could receive messages before it had recovered from disk (simulator bug).
-- A cut-off node won an *older* term through delayed votes after a newer term had committed an
-  entry it lacked. Raft allows that; the invariant checker was too strict.
-- A misplaced write can cover several records at once, so a damaged log end looked exactly like
-  a torn write. Log length now lives in a separate file.
+**Found while building it.** The simulator found real bugs in this repository's own Raft,
+storage format, simulator and checkers; [docs/BUG_MUSEUM.md](docs/BUG_MUSEUM.md) has each one
+with its seed, cause and fix. Some highlights:
 - After a failed `fsync` the node halts, but the rest of that event kept writing to disk and
   synced a record after the dropped one: fsyncgate in our own code. Halting now cuts off storage.
 - A crash between switching to a new snapshot and recording the new log end made recovery report
   damage that wasn't there; three servers stopped voting and the cluster never elected a leader
   again. Found as one liveness failure in 100,000 seeds, then directly by a new check that fails
   any run where a server claims disk damage the simulator never caused.
+- A misplaced write can cover several records at once, so a damaged log end looked exactly like
+  a torn write. Log length now lives in a separate file.
+- A cut-off node won an *older* term through delayed votes after a newer term had committed an
+  entry it lacked. Raft allows that; the invariant checker was too strict.
 
 ## How it works
 
@@ -165,8 +171,11 @@ crashed) may or may not have taken effect.
 the random nemesis (bit-identical: restart delays have their own random stream). It then deletes
 faults with delta debugging, switches off whole fault types, drops clients and operations, and
 ends the fault period earlier, keeping each change only if the run still fails the same way.
-Typical results: 35 faults → 3, 24 → 1, 12 → 1. Rare, timing-sensitive failures shrink less: deleting
-any fault changes every later interleaving. The output is a small text scenario file that
+Over 42 failing seeds (up to five per planted bug) it took 0.1–2 s and about 110 simulations
+each. Faults fell 3x at the median (618 → 213 in total; 11 runs needed no faults at all, and
+81 → 7 and 18 → 1 were among the best), while event counts fell only 1.3x at the median (6.3x at
+best), because with fewer faults a failure can take longer to show. Rare, timing-sensitive failures shrink least: deleting any
+fault changes every later interleaving. The output is a small text scenario file that
 `dst run --scenario` replays.
 
 **Trace viewer.** `dst run --html run.html` writes a single self-contained page (no dependencies)
@@ -227,6 +236,8 @@ Bugs: `local-reads`, `vote-without-log-check`, `forget-vote`, `truncate-without-
 | `dst-cli` | `dst` command-line tool: `run`, `sweep`, `bugs`, `shrink`, `serve`, `client` |
 
 `viewer/index.html` is the trace viewer (it also opens JSON from `dst run --json`).
+`.github/workflows` holds CI (format, lint, tests and docs on Linux and Windows), the seed sweeps,
+and an on-demand CPU flamegraph of a one-thread sweep (`Profile`, run by hand).
 
 ## References
 

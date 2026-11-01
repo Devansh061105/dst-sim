@@ -30,6 +30,7 @@ pub struct Entry {
     pub data: Vec<u8>,
 }
 
+/// Messages between Raft servers (Figure 2 of the paper, plus ReadIndex and snapshots).
 #[derive(Clone, Debug, Hash)]
 pub enum RaftMsg {
     RequestVote {
@@ -111,12 +112,14 @@ impl RaftMsg {
     }
 }
 
+/// Timers a Raft server sets on its host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RaftTimer {
     Election,
     Heartbeat,
 }
 
+/// What a server currently is in its term.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     Follower,
@@ -124,6 +127,7 @@ pub enum Role {
     Leader,
 }
 
+/// Cluster membership, timing, and any planted bugs.
 #[derive(Clone, Debug)]
 pub struct RaftConfig {
     /// Every server in the cluster, including this one.
@@ -131,13 +135,16 @@ pub struct RaftConfig {
     /// A follower that hears nothing from a leader for a random time in this range starts an
     /// election. The randomness makes repeated split votes unlikely.
     pub election_timeout: Range<Duration>,
+    /// How often a leader sends AppendEntries when it has nothing new.
     pub heartbeat: Duration,
     /// Most entries per AppendEntries message.
     pub max_batch: usize,
+    /// Planted bugs (all off by default).
     pub bugs: Bugs,
 }
 
 impl RaftConfig {
+    /// Defaults: election timeout 150–300 ms, heartbeat 50 ms, batches of 64.
     pub fn new(members: Vec<NodeId>) -> Self {
         RaftConfig {
             members,
@@ -184,8 +191,11 @@ pub struct NotLeader {
     pub leader: Option<NodeId>,
 }
 
+/// What Raft needs from its host: a network, timers, a disk and randomness.
 pub type RaftContext<'a> = dyn Context<RaftMsg, RaftTimer> + 'a;
 
+/// One Raft server. A library: the host feeds it messages and timers and applies what
+/// commits (see [`Raft::take_committed`]).
 #[derive(Debug)]
 pub struct Raft {
     id: NodeId,
@@ -210,6 +220,7 @@ pub struct Raft {
 }
 
 impl Raft {
+    /// A server that has not started yet; [`Raft::start`] recovers it from disk.
     pub fn new(id: NodeId, config: RaftConfig) -> Self {
         assert!(config.members.contains(&id), "{id} is not a member of its own cluster");
         Raft {
@@ -243,12 +254,14 @@ impl Raft {
         self.reset_election_timer(ctx);
     }
 
+    /// Handles a message. A failed `fsync` halts the process (see [`Context::halt`]).
     pub fn handle_message(&mut self, ctx: &mut RaftContext<'_>, from: NodeId, msg: RaftMsg) {
         if self.on_message(ctx, from, msg).is_err() {
             ctx.halt();
         }
     }
 
+    /// Handles a timer; ignores one that was replaced or cancelled.
     pub fn handle_timer(&mut self, ctx: &mut RaftContext<'_>, id: TimerId, timer: RaftTimer) {
         if self.on_timer(ctx, id, timer).is_err() {
             ctx.halt();

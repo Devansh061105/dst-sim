@@ -18,6 +18,7 @@ pub enum Op {
     },
 }
 
+/// What an operation returned to the client.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum OpResult {
     Value(Option<u64>),
@@ -26,6 +27,7 @@ pub enum OpResult {
 }
 
 impl Op {
+    /// Applies the operation to the store: the sequential specification of the service.
     pub fn apply(&self, store: &mut BTreeMap<u8, u64>) -> OpResult {
         match *self {
             Op::Get { key } => OpResult::Value(store.get(&key).copied()),

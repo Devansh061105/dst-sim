@@ -42,10 +42,12 @@ pub enum Mode {
 }
 
 impl Mode {
+    /// The simulator configuration for one seed of the standard cluster.
     pub fn config(self, seed: u64) -> SimConfig {
         self.config_for(seed, NODES)
     }
 
+    /// The same for a cluster with `nodes` nodes (servers plus clients).
     pub fn config_for(self, seed: u64, nodes: u32) -> SimConfig {
         let mut config = match self {
             Mode::Calm => SimConfig::new(seed, nodes),

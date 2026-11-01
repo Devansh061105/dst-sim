@@ -19,6 +19,7 @@ pub struct Decoded {
 pub const HEADER_LEN: usize = 8;
 const HEADER: usize = HEADER_LEN;
 
+/// Frames a payload as one record: `[crc32][len][payload]`.
 pub fn encode(payload: &[u8]) -> Vec<u8> {
     let len = u32::try_from(payload.len()).expect("record payload larger than 4 GiB");
     let len_bytes = len.to_le_bytes();

@@ -129,6 +129,7 @@ impl Scenario {
         SERVERS + self.clients
     }
 
+    /// The simulator configuration: the mode's, with knobs switched off and the script, if any.
     pub fn config(&self) -> SimConfig {
         let mut config = self.mode.config_for(self.seed, self.nodes());
         for knob in &self.off {
@@ -149,6 +150,7 @@ impl Scenario {
         config
     }
 
+    /// Runs the scenario and checks it. Same scenario, same outcome.
     pub fn run(&self, keep_trace: bool) -> Outcome {
         let config = SimConfig { keep_trace_lines: keep_trace, ..self.config() };
         run_cluster(config, SERVERS, self.ops, self.bug.map(Bug::bugs).unwrap_or_default())

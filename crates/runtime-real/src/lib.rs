@@ -33,6 +33,7 @@ const SEND_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// How messages become bytes and back.
 pub struct Codec<M> {
+    /// Turns a message into bytes.
     pub encode: fn(&M) -> Vec<u8>,
     /// `None` for bytes that are not a message (they are dropped).
     pub decode: fn(&[u8]) -> Option<M>,
