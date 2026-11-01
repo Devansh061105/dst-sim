@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
-use raft::{Applied, NotLeader, Raft, RaftConfig, RaftMsg, RaftTimer, ReadOutcome};
+use raft::{Applied, ChangeError, NotLeader, Raft, RaftConfig, RaftMsg, RaftTimer, ReadOutcome};
 use sim_api::{NodeId, SubContext, TimerId};
 
 use crate::command::{Command, Op, OpResult, RequestId, Sessions, decode_state, encode_state};
-use crate::{Bugs, KvContext, KvMsg, KvTimer, Reply};
+use crate::{Bugs, Change, KvContext, KvMsg, KvTimer, ReconfigReply, Reply};
 
 /// A replica: Raft plus the key-value map it builds by applying committed commands in log order.
 #[derive(Debug)]
@@ -22,6 +22,9 @@ pub struct Server {
     next_read: u64,
     bugs: Bugs,
 }
+
+/// The admin never shrinks the configuration below this many servers.
+pub const MIN_MEMBERS: usize = 3;
 
 /// Compact the log once this many applied entries are not yet in the snapshot.
 const COMPACT_AFTER: u64 = 32;
@@ -64,6 +67,40 @@ impl Server {
     pub(crate) fn on_raft_message(&mut self, ctx: &mut KvContext<'_>, from: NodeId, msg: RaftMsg) {
         self.maybe_compact(ctx);
         self.raft.handle_message(&mut raft_ctx(ctx), from, msg);
+        self.apply_committed(ctx);
+        self.answer_reads(ctx);
+    }
+
+    /// Starts a configuration change for the admin, if this server leads.
+    pub(crate) fn on_reconfigure(
+        &mut self,
+        ctx: &mut KvContext<'_>,
+        from: NodeId,
+        id: u64,
+        change: Change,
+    ) {
+        self.maybe_compact(ctx);
+        let mut target = self.raft.members().to_vec();
+        match change {
+            Change::Add(server) if !target.contains(&server) => target.push(server),
+            Change::Remove(server) => target.retain(|&m| m != server),
+            Change::Add(_) => {}
+        }
+        // Already the configuration here, or a removal that would leave too few servers to
+        // survive a failure: nothing to do.
+        let reply = if target.len() == self.raft.members().len() || target.len() < MIN_MEMBERS {
+            ReconfigReply::Accepted
+        } else {
+            match self.raft.change_membership(&mut raft_ctx(ctx), target) {
+                Ok(_) => ReconfigReply::Accepted,
+                Err(ChangeError::NotLeader(NotLeader { leader })) => {
+                    ReconfigReply::NotLeader(leader)
+                }
+                Err(ChangeError::Busy | ChangeError::NotOneServer) => ReconfigReply::Busy,
+            }
+        };
+        let members = self.raft.members().to_vec();
+        ctx.send(from, KvMsg::Reconfigured { id, reply, members });
         self.apply_committed(ctx);
         self.answer_reads(ctx);
     }

@@ -88,6 +88,7 @@ dependencies = [
  "runtime-real",
  "sim-api",
  "sim-core",
+ "twopc",
 ]
 
 [[package]]
@@ -204,6 +205,14 @@ name = "sim-api"
 version = "0.1.0"
 
 [[package]]
+name = "sim-async"
+version = "0.1.0"
+dependencies = [
+ "sim-api",
+ "sim-core",
+]
+
+[[package]]
 name = "sim-core"
 version = "0.1.0"
 dependencies = [
@@ -253,6 +262,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "twopc"
+version = "0.1.0"
+dependencies = [
+ "sim-api",
+ "sim-core",
 ]
 
 [[package]]

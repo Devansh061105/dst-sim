@@ -1,7 +1,8 @@
 # Bug museum
 
-Real bugs the simulator found in this repository's own code: the Raft implementation, its
-storage format, the simulator, and the checkers. None of them were planted. Each entry says how
+Real bugs the simulator found in this repository's own code: the Raft implementation (including
+its membership changes), its storage format, the two-phase commit system, the simulator, and the
+checkers. None of them were planted. Each entry says how
 the bug showed up, what caused it, how it was fixed, and what now keeps it from coming back.
 
 Seeds name the run that first exposed a bug, on the code as it was then. They pass now, because
@@ -163,6 +164,81 @@ today, and `dst shrink` plus `dst run --html` turn it into a small trace.
   falling back to an older log it can also *disagree* with the committed log.
 - **Fix.** For a repairing server the checker walks back to the longest prefix that still agrees
   with the committed log.
+
+## Membership changes
+
+### A server just added couldn't vote for the real leader, and no one was ever elected
+
+- **Symptom.** Membership runs, about 1 in 1,000 chaos seeds: liveness failures with terms in
+  the hundreds, elections failing for the whole calm period.
+- **Cause.** The first version ignored vote requests from servers outside the receiver's own
+  configuration, so a removed server couldn't disrupt the cluster. But the receiver's view can be
+  the stale one: a server just added, with an empty log, still believes the *initial*
+  configuration. It refused the leader-to-be, which needed its vote under the newest
+  configuration; another member was repairing a damaged disk and couldn't vote either.
+- **Fix.** Ignore outsiders' vote requests only while a leader is known to be alive (heard from
+  within the minimum election timeout), as in the Raft thesis (§4.2.3). That still protects a
+  healthy cluster, and lets everyone vote when there is no leader.
+- **Guard.** 300,000 membership runs (calm, chaos, swarm) pass.
+
+### A server holding the newest entries refused to campaign
+
+- **Symptom.** Chaos seed 1193 (membership): no leader for 50 seconds.
+- **Cause.** Servers outside their own latest configuration never campaigned. Here the server
+  with the most up-to-date log had an uncommitted configuration that removed it; the others'
+  shorter logs failed its "at least as up to date" check, and one was repairing its disk. Nobody
+  could win.
+- **Fix.** A server outside its latest configuration still campaigns while that configuration is
+  uncommitted (it may hold entries the others need, thesis §4.2.2), counting members' votes but
+  not its own; once the change commits it steps down and stays out.
+
+### Removals shrank the cluster to two servers
+
+- **Symptom.** Swarm seed 522 (membership): no leader. Two members, one of them repairing a damaged
+  disk, so no majority.
+- **Cause.** The admin chose removals from its own, sometimes stale, view of the membership; its
+  "at least three members" rule didn't hold.
+- **Fix.** The server checks the rule against its own configuration when it receives the
+  request.
+
+### Stale hints sent the admin and clients in circles
+
+- **Symptom.** 14 of 2,000 *calm* membership runs: an admin (and, in other seeds, a client) never
+  finished although the cluster had a healthy leader.
+- **Cause.** Removed servers keep stale views. One said "the leader is n1"; n1, also removed,
+  said "I don't know" and the next server tried was the first one again, forever.
+- **Fix.** Follow a leader hint at most a few times, then try servers in turn. For clients this
+  is enabled only in clusters whose membership changes: runs without membership changes can meet
+  a hint cycle too (chaos seed 93 loses about 3 seconds to one), but always escape it, and
+  leaving them exactly as they were keeps every existing seed reproducible.
+
+## Two-phase commit
+
+### A restart during redelivery forgot an older decision
+
+- **Symptom.** Chaos seed 104: liveness failure; one participant never learned the outcome of
+  transaction 13.
+- **Cause.** The coordinator's recovery resent only its *last* decision, assuming earlier ones had
+  all been acknowledged. It restarted while still delivering transaction 13 (one participant was
+  partitioned); the presumed abort it logged for the next transaction made 13 no longer last, and
+  the next restart forgot it.
+- **Fix.** Once every participant acknowledges a decision, the coordinator logs a *done* record
+  (unsynced; losing it only means resending). Recovery resends every decision without one.
+- **Guard.** `seeds_that_found_real_bugs_pass` in `crates/twopc/tests/sweep.rs`.
+
+### An unsynced truncate brought back a commit nobody decided
+
+- **Symptom.** 7 of 200,000 seeds, all "validity: transaction committed without a yes vote";
+  swarm seed 2571 fails at 0.68 s.
+- **Cause.** The coordinator wrote a commit decision together with an unsynced *done* record and
+  crashed in the middle of the `fsync`: the decision reached the disk, the record before it didn't,
+  leaving a gap. Recovery cut the log at the gap but didn't sync the cut before appending a
+  presumed-abort record; the next crash kept the append and lost the cut. The new record was the
+  same size as the lost one, filled the gap exactly, and made the stale commit readable again, at
+  the position of the next transaction. The same class of mistake as the planted Raft bug
+  `single-sync-truncate`.
+- **Fix.** Recovery syncs the cut on its own before anything is appended.
+- **Guard.** `seeds_that_found_real_bugs_pass` in `crates/twopc/tests/sweep.rs`.
 
 ## Smaller ones
 

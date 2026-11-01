@@ -81,15 +81,33 @@ Advanced = what makes it stand out, Stretch = only if time remains.
 23. **CI.** GitHub Actions on Linux and Windows: unit tests, clippy, a sweep of 10,000 seeds per
     push, a larger nightly sweep, and failing seeds uploaded as artifacts.
 
-### Tier 3 — Stretch (only after Tier 2 is polished)
-24. Raft membership changes (joint consensus or single-server changes).
-25. A second system under test (chain replication or a deliberately broken two-phase commit) to
-    prove the framework is generic.
-26. State-coverage tracking: hash abstract Raft states and report distinct states explored per
-    1,000 seeds; bias fault choices toward unseen states.
-27. An async facade: a tiny deterministic `Future` executor so nodes can be written with
-    `async/await`.
-28. A trace viewer compiled to WASM that replays a seed in the browser.
+### Tier 3 — Stretch (only after Tier 2 is polished; F24–F27 built in Phase 9)
+24. **Raft membership changes.** Single-server changes (Raft thesis §4.1): a configuration is a
+    log entry, every server uses the latest configuration in its log (committed or not), a leader
+    starts a change only once the previous one has committed *and* it has committed an entry in
+    its own term (the 2015 fix to single-server changes). Configurations survive snapshots. The
+    simulation adds and removes servers from a pool while clients run (the invariant checker's
+    properties hold whoever the members are, so it needed no change). Planted bugs: two changes
+    in flight at once,
+    the missing own-term commit, deciding with the committed instead of the latest
+    configuration.
+25. **A second system under test: two-phase commit.** A coordinator and participants that vote,
+    log their state durably, recover after crashes, and finish transactions after the fault
+    period. Own checker (atomicity: no transaction both committed and aborted; validity: commit
+    only if every participant voted yes; durability: an acknowledged decision survives
+    restarts) and its own planted bugs. Runs on the unchanged simulator, through the same
+    `dst` sweeps, to show the framework is generic.
+26. **State coverage.** Hash an abstract cluster state after every step (each server's role,
+    whether it is up, term and log position relative to the cluster, commit lag, leader count) and
+    report distinct states explored per 1,000 seeds. A coverage-guided mode keeps the fault mixes
+    of runs that found new states and mutates them for later runs, like a fuzzer's corpus;
+    measured against plain swarm testing on states explored and on how fast the rare planted
+    bugs are found. Campaigns stay reproducible from one seed.
+27. **An async facade.** A tiny deterministic executor (no threads, no runtime, a no-op waker)
+    so a node can be written as one `async` function that awaits messages and sleeps; it runs
+    on the unchanged simulator as an ordinary `Node`. Demo: a protocol written both ways.
+28. A trace viewer compiled to WASM that replays a seed in the browser (not planned: it needs a
+    second toolchain on a tight disk).
 
 ---
 
@@ -131,9 +149,12 @@ dst-sim/
 │   ├── sim-core/           # RNG, clock, event queue, simulator loop, trace
 │   ├── sim-net/            # network fault model
 │   ├── sim-disk/           # disk fault model
+│   ├── sim-async/          # nodes written as async functions (feature 27)
 │   ├── checker/            # linearizability checker + history types
 │   ├── raft/               # Raft library (depends only on sim-api)
 │   ├── kv/                 # KV state machine + client on top of raft
+│   ├── twopc/              # second system under test: two-phase commit (feature 25)
+│   ├── harness/            # checked runs, scenarios, shrinker, state coverage
 │   ├── runtime-real/       # real TCP + file Context (feature 21)
 │   └── dst-cli/            # `dst` binary
 ├── viewer/                 # static HTML/JS trace viewer
@@ -216,23 +237,27 @@ dst-sim/
 
 ---
 
-## 8. Resume bullets (real numbers, measured at the end of Phase 8)
+## 8. Resume bullets (real numbers, measured at the end of Phase 9)
 
-- Built a deterministic simulation testing framework in Rust (10 crates, ~9k lines) that runs a
+- Built a deterministic simulation testing framework in Rust (12 crates, ~12k lines) that runs a
   Raft key-value cluster on one thread **~4,200× faster than real time**; any failure replays
   bit-for-bit from a single 64-bit seed, verified across Linux and Windows in CI.
 - Injected partitions, message loss, duplication and reordering, crashes, clock drift and disk
   faults (torn writes, lost and failed `fsync`, crashes mid-`fsync`, bit flips, misplaced writes);
   checked all five Raft safety properties after every step and client histories with a custom
   linearizability checker (WGL search).
-- Caught **all 11 planted consensus and storage bugs**: 9 by random fault search (the common
-  ones in a mean of **1–26 seeds**) and the 2 that random faults never reach (Raft's Figure 8, a
-  crash inside a shared `fsync`) by targeted step-by-step scenarios; a delta-debugging shrinker cuts failing fault schedules **3× at the median**, viewed as
-  space-time diagrams in a self-contained HTML trace viewer.
-- Found and fixed **16 real bugs and test gaps** in my own Raft, storage, simulator and
-  checkers, one as rare as 1 in 300,000 seeds; **874 simulated cluster-hours** (500,000 seeds)
-  pass in under two minutes on 16 threads, and the same code survives repeated `kill -9` as real
-  processes over TCP.
+- Caught **all 18 planted bugs** across Raft, its membership changes and a second system
+  (two-phase commit): 15 by random fault search (the common ones in a mean of **1–26 seeds**) and
+  the 3 that random faults never reach (Raft's Figure 8, a crash inside a shared `fsync`, the 2015
+  single-server membership bug) by targeted step-by-step scenarios; a delta-debugging shrinker
+  cuts failing fault schedules **3× at the median**, viewed in a self-contained HTML trace viewer.
+- Added Raft membership changes that leave every run without them **bit-for-bit unchanged**, and
+  coverage-guided swarm testing (a fuzzer-style corpus of fault mixes) that explores **18% more
+  abstract cluster states** and catches a rare bug **1.6× as often** as plain swarm testing.
+- Found and fixed **22 real bugs and test gaps** in my own Raft, storage, two-phase commit,
+  simulator and checkers, one as rare as 1 in 300,000 seeds; **874 simulated cluster-hours**
+  (500,000 seeds) pass in under two minutes on 16 threads, and the same code survives repeated
+  `kill -9` as real processes over TCP.
 
 ---
 

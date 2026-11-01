@@ -286,7 +286,7 @@ mod tests {
     use crate::RaftConfig;
 
     fn entry(term: u64, byte: u8) -> Entry {
-        Entry { term, data: vec![byte] }
+        Entry { term, data: vec![byte], config: None }
     }
 
     fn node(id: u32, term: u64, role: Role, log: Vec<Entry>, commit: u64) -> Raft {

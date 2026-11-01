@@ -15,19 +15,48 @@ mod durable;
 mod wire;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::time::Duration;
 
-use sim_api::{Context, NodeId, SyncError, TimerId};
+use sim_api::{Context, NodeId, SyncError, Time, TimerId};
 
 pub use check::{Checker, Violation};
 use durable::{Durable, Snapshot};
 
 /// A log entry. A new leader appends one with empty `data` (a no-op) to commit earlier entries.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// A configuration entry (see [`Raft::change_membership`]) has no data and the new member list in
+/// `config`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub term: u64,
     pub data: Vec<u8>,
+    pub config: Option<Vec<NodeId>>,
+}
+
+// By hand, so an entry without a configuration hashes exactly as it did before the field
+// existed: traces of runs without membership changes are unchanged.
+impl Hash for Entry {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.term.hash(state);
+        self.data.hash(state);
+        if let Some(members) = &self.config {
+            members.hash(state);
+        }
+    }
+}
+
+/// The configuration an InstallSnapshot carries; `None` while it is still the initial one.
+/// Hashes to nothing when `None`, for the same reason as [`Entry`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotMembers(pub Option<Vec<NodeId>>);
+
+impl Hash for SnapshotMembers {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        if let Some(members) = &self.0 {
+            members.hash(state);
+        }
+    }
 }
 
 /// Messages between Raft servers (Figure 2 of the paper, plus ReadIndex and snapshots).
@@ -68,6 +97,8 @@ pub enum RaftMsg {
         last_term: u64,
         data: Vec<u8>,
         read_round: u64,
+        /// The configuration as of `index`.
+        members: SnapshotMembers,
     },
 }
 
@@ -130,7 +161,8 @@ pub enum Role {
 /// Cluster membership, timing, and any planted bugs.
 #[derive(Clone, Debug)]
 pub struct RaftConfig {
-    /// Every server in the cluster, including this one.
+    /// The initial configuration: the servers that start out as members. A server not in it
+    /// waits, without campaigning, until a configuration change adds it.
     pub members: Vec<NodeId>,
     /// A follower that hears nothing from a leader for a random time in this range starts an
     /// election. The randomness makes repeated split votes unlikely.
@@ -183,6 +215,26 @@ pub struct Bugs {
     /// Serve reads without first confirming leadership with a majority, so a deposed leader that
     /// hasn't noticed yet answers from stale state.
     pub read_without_quorum: bool,
+    /// Start a configuration change before the previous one has committed, so two changes can
+    /// be in flight and their majorities need not overlap.
+    pub concurrent_changes: bool,
+    /// Change the configuration before committing an entry of the leader's own term (the bug in
+    /// the original single-server change algorithm, fixed in 2015).
+    pub change_before_commit_in_term: bool,
+    /// Use the latest *committed* configuration instead of the latest one in the log.
+    pub use_committed_config: bool,
+}
+
+/// Why [`Raft::change_membership`] refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeError {
+    /// Only the leader changes the configuration.
+    NotLeader(NotLeader),
+    /// A previous change hasn't committed yet, or this leader hasn't committed an entry of its
+    /// own term yet: try again shortly.
+    Busy,
+    /// The new configuration must add or remove exactly one server.
+    NotOneServer,
 }
 
 /// Returned by [`Raft::propose`] on a node that is not the leader, with its best guess at who is.
@@ -217,14 +269,22 @@ pub struct Raft {
     /// Leader only: the latest read round each peer has answered in this term.
     acked_rounds: BTreeMap<NodeId, u64>,
     reads: Vec<PendingRead>,
+    /// The configuration in effect: the latest one in the log (see `refresh_members`).
+    members: Vec<NodeId>,
+    /// The index of the entry that set `members` (0: the snapshot's or the initial one).
+    config_index: u64,
+    /// When this node last heard from a leader of its current term (local clock).
+    heard_from_leader: Option<Time>,
 }
 
 impl Raft {
     /// A server that has not started yet; [`Raft::start`] recovers it from disk.
     pub fn new(id: NodeId, config: RaftConfig) -> Self {
-        assert!(config.members.contains(&id), "{id} is not a member of its own cluster");
         Raft {
             id,
+            members: config.members.clone(),
+            config_index: 0,
+            heard_from_leader: None,
             config,
             durable: Durable::default(),
             commit_index: 0,
@@ -251,6 +311,7 @@ impl Raft {
         }
         // A snapshot only ever holds committed entries; the host restores it first.
         self.commit_index = self.durable.snapshot.index;
+        self.refresh_members();
         self.reset_election_timer(ctx);
     }
 
@@ -274,12 +335,12 @@ impl Raft {
         if self.role != Role::Leader {
             return Err(NotLeader { leader: self.leader });
         }
-        let entry = Entry { term: self.durable.term, data };
+        let entry = Entry { term: self.durable.term, data, config: None };
         if self.durable.append(ctx.storage(), &[entry], self.sync_appends()).is_err() {
             ctx.halt();
             return Err(NotLeader { leader: None });
         }
-        self.advance_commit();
+        self.advance_commit(ctx);
         // BUGGIFY: leave it to the next heartbeat instead of replicating right away.
         if !ctx.buggify() {
             self.broadcast_append(ctx);
@@ -313,10 +374,72 @@ impl Raft {
         let Some(term) = self.term_at(index).filter(|_| index > self.durable.snapshot.index) else {
             return;
         };
-        let snapshot = Snapshot { index, term, data };
+        let (members, _) = self.members_at(index);
+        let members = (members != self.config.members).then_some(members);
+        let snapshot = Snapshot { index, term, data, members };
         if self.durable.install_snapshot(ctx.storage(), snapshot, true).is_err() {
             ctx.halt();
         }
+    }
+
+    /// Proposes adding or removing one server (single-server changes, Raft thesis section 4.1).
+    /// The new configuration takes effect on each server as soon as the entry reaches its log,
+    /// committed or not; one change at a time, and only once this leader has committed an entry
+    /// of its own term. Returns the entry's index; the change is done once that index commits.
+    pub fn change_membership(
+        &mut self,
+        ctx: &mut RaftContext<'_>,
+        members: Vec<NodeId>,
+    ) -> Result<u64, ChangeError> {
+        if self.role != Role::Leader {
+            return Err(ChangeError::NotLeader(NotLeader { leader: self.leader }));
+        }
+        let mut members = members;
+        members.sort_unstable();
+        members.dedup();
+        let added = members.iter().filter(|m| !self.members.contains(m)).count();
+        let removed = self.members.iter().filter(|m| !members.contains(m)).count();
+        if added + removed != 1 {
+            return Err(ChangeError::NotOneServer);
+        }
+        let bugs = self.config.bugs;
+        // With two changes in flight, the oldest and newest configurations can differ by two
+        // servers, and then two majorities need not overlap.
+        if self.config_index > self.commit_index && !bugs.concurrent_changes {
+            return Err(ChangeError::Busy);
+        }
+        // A leader that hasn't committed in its own term may hold a stale configuration change
+        // from an older term that will be overwritten; changing on top of it can again leave
+        // two non-overlapping majorities (Ongaro, raft-dev 2015).
+        if self.term_at(self.commit_index) != Some(self.durable.term)
+            && !bugs.change_before_commit_in_term
+        {
+            return Err(ChangeError::Busy);
+        }
+        let entry = Entry { term: self.durable.term, data: Vec::new(), config: Some(members) };
+        if self.durable.append(ctx.storage(), &[entry], self.sync_appends()).is_err() {
+            ctx.halt();
+            return Err(ChangeError::NotLeader(NotLeader { leader: None }));
+        }
+        self.refresh_members();
+        self.advance_commit(ctx);
+        self.broadcast_append(ctx);
+        Ok(self.last_index())
+    }
+
+    /// The configuration in effect on this server.
+    pub fn members(&self) -> &[NodeId] {
+        &self.members
+    }
+
+    /// Whether this server is in its own configuration (only members vote and campaign).
+    pub fn is_member(&self) -> bool {
+        self.members.contains(&self.id)
+    }
+
+    /// Whether the configuration in effect has committed (no change is in flight).
+    pub fn config_committed(&self) -> bool {
+        self.config_index <= self.commit_index
     }
 
     /// The last entry the host has been given to apply.
@@ -398,9 +521,11 @@ impl Raft {
         }
         let mut rounds: Vec<u64> =
             self.peers().iter().map(|p| self.acked_rounds.get(p).copied().unwrap_or(0)).collect();
-        rounds.push(self.read_round);
+        if self.is_member() {
+            rounds.push(self.read_round);
+        }
         rounds.sort_unstable_by(|a, b| b.cmp(a));
-        rounds[self.majority() - 1]
+        rounds.get(self.majority() - 1).copied().unwrap_or(0)
     }
 
     pub fn id(&self) -> NodeId {
@@ -445,6 +570,17 @@ impl Raft {
         from: NodeId,
         msg: RaftMsg,
     ) -> Result<(), SyncError> {
+        // A server outside our configuration may have been removed without hearing about it, and
+        // its vote requests would raise everyone's term over and over. Ignore them while a leader
+        // is known to be alive (Raft thesis section 4.2.3). Not otherwise: our own view of the
+        // configuration may be the stale one (a server just added still has the initial one),
+        // and refusing to vote then can leave the cluster without a leader for good.
+        if matches!(msg, RaftMsg::RequestVote { .. })
+            && !self.members.contains(&from)
+            && self.leader_alive(ctx)
+        {
+            return Ok(());
+        }
         // Any message from a later term means this node is behind: adopt the term as a follower.
         if msg.term() > self.durable.term {
             self.step_down(ctx, msg.term())?;
@@ -474,7 +610,7 @@ impl Raft {
             RaftMsg::Vote { term, granted } => {
                 if self.role == Role::Candidate && term == self.durable.term && granted {
                     self.votes.insert(from);
-                    if self.votes.len() >= self.majority() {
+                    if self.member_votes() >= self.majority() {
                         self.become_leader(ctx)?;
                     }
                 }
@@ -498,12 +634,15 @@ impl Raft {
                     read_round,
                 )?;
             }
-            RaftMsg::InstallSnapshot { term, index, last_term, data, read_round } => {
-                let snapshot = Snapshot { index, term: last_term, data };
+            RaftMsg::InstallSnapshot { term, index, last_term, data, read_round, members } => {
+                let snapshot = Snapshot { index, term: last_term, data, members: members.0 };
                 self.on_install_snapshot(ctx, from, term, snapshot, read_round)?;
             }
             RaftMsg::AppendResult { term, success, index, read_round } => {
-                if self.role != Role::Leader || term != self.durable.term {
+                if self.role != Role::Leader
+                    || term != self.durable.term
+                    || !self.match_index.contains_key(&from)
+                {
                     return Ok(());
                 }
                 // Any answer in this term, success or not, shows the peer still followed this
@@ -517,7 +656,7 @@ impl Raft {
                     let matched = matched.max(index);
                     self.match_index.insert(from, matched);
                     *next = (*next).max(matched + 1);
-                    self.advance_commit();
+                    self.advance_commit(ctx);
                     if self.next_index[&from] <= self.last_index() {
                         self.send_append(ctx, from);
                     }
@@ -624,6 +763,7 @@ impl Raft {
         let last_new = prev_log_index + count;
         let bound = if self.config.bugs.commit_beyond_match { self.last_index() } else { last_new };
         self.commit_index = self.commit_index.max(leader_commit.min(bound));
+        self.refresh_members();
         reply(ctx, self.durable.term, true, last_new);
         Ok(())
     }
@@ -648,6 +788,7 @@ impl Raft {
             let keep_tail = self.term_at(index) == Some(snapshot.term);
             self.durable.install_snapshot(ctx.storage(), snapshot, keep_tail)?;
             self.commit_index = index;
+            self.refresh_members();
             self.maybe_end_rejoining(ctx)?;
         }
         let result = RaftMsg::AppendResult { term, success: true, index, read_round };
@@ -672,7 +813,14 @@ impl Raft {
             }
         }
         self.leader = Some(leader);
+        self.heard_from_leader = Some(ctx.now());
         self.reset_election_timer(ctx);
+    }
+
+    /// Whether this node leads, or heard from its leader within the minimum election timeout.
+    fn leader_alive(&self, ctx: &RaftContext<'_>) -> bool {
+        let lease = self.config.election_timeout.start;
+        self.role == Role::Leader || self.heard_from_leader.is_some_and(|at| ctx.now() < at + lease)
     }
 
     /// A rejoining node votes again once it holds an entry from a term after the one it lost data
@@ -696,7 +844,11 @@ impl Raft {
         match timer {
             RaftTimer::Election if self.election_timer == Some(id) => {
                 self.election_timer = None;
-                if self.is_rejoining() {
+                // A server outside its own latest configuration still campaigns while that
+                // configuration is uncommitted: it may hold entries the others need to commit
+                // it (Raft thesis section 4.2.2). Once committed, it is out for good.
+                let removed = !self.is_member() && self.config_committed();
+                if self.is_rejoining() || removed {
                     // Its own vote would count, so it may not campaign either: just keep waiting
                     // for a leader.
                     self.reset_election_timer(ctx);
@@ -728,7 +880,7 @@ impl Raft {
         self.leader = None;
         self.votes = BTreeSet::from([self.id]);
         self.reset_election_timer(ctx);
-        if self.votes.len() >= self.majority() {
+        if self.member_votes() >= self.majority() {
             return self.become_leader(ctx);
         }
         let request = RaftMsg::RequestVote {
@@ -756,9 +908,9 @@ impl Raft {
             self.acked_rounds.insert(peer, 0);
         }
         // A no-op from this term: committing it also commits every earlier entry (Raft §5.4.2).
-        let noop = Entry { term: self.durable.term, data: Vec::new() };
+        let noop = Entry { term: self.durable.term, data: Vec::new(), config: None };
         self.durable.append(ctx.storage(), &[noop], self.sync_appends())?;
-        self.advance_commit();
+        self.advance_commit(ctx);
         self.broadcast_append(ctx);
         if let Some(t) = self.heartbeat_timer.take() {
             ctx.cancel_timer(t);
@@ -801,6 +953,7 @@ impl Raft {
                 last_term: snapshot.term,
                 data: snapshot.data.clone(),
                 read_round: self.read_round,
+                members: SnapshotMembers(snapshot.members.clone()),
             };
             return ctx.send(peer, msg);
         };
@@ -824,18 +977,71 @@ impl Raft {
     /// Leader: commit the highest index stored on a majority, if it is from the current term.
     /// Entries from earlier terms are never committed by counting replicas (Figure 8 of the paper
     /// shows how that loses data); they commit along with a later current-term entry.
-    fn advance_commit(&mut self) {
+    fn advance_commit(&mut self, ctx: &mut RaftContext<'_>) {
         if self.role != Role::Leader {
             return;
         }
-        let mut matched: Vec<u64> = self.match_index.values().copied().collect();
-        matched.push(self.last_index());
+        // Only members count; a leader being removed manages the cluster without counting itself.
+        let mut matched: Vec<u64> =
+            self.peers().iter().map(|p| self.match_index.get(p).copied().unwrap_or(0)).collect();
+        if self.is_member() {
+            matched.push(self.last_index());
+        }
         matched.sort_unstable_by(|a, b| b.cmp(a));
-        let candidate = matched[self.majority() - 1];
+        let Some(&candidate) = matched.get(self.majority() - 1) else { return };
         let current_term = self.term_at(candidate) == Some(self.durable.term);
         if candidate > self.commit_index && (current_term || self.config.bugs.commit_old_terms) {
             self.commit_index = candidate;
+            self.refresh_members();
         }
+        // Once the configuration that removed it has committed, a leader steps down; it no
+        // longer campaigns either.
+        if !self.is_member() && self.config_committed() {
+            self.role = Role::Follower;
+            self.leader = None;
+            if let Some(t) = self.heartbeat_timer.take() {
+                ctx.cancel_timer(t);
+            }
+            self.reset_election_timer(ctx);
+        }
+    }
+
+    /// Recomputes the configuration in effect: the latest configuration entry in the log
+    /// (committed or not), else the snapshot's, else the initial one. A leader starts tracking
+    /// any server that became a member.
+    fn refresh_members(&mut self) {
+        let limit = if self.config.bugs.use_committed_config {
+            self.commit_index
+        } else {
+            self.last_index()
+        };
+        (self.members, self.config_index) = self.members_at(limit);
+        if self.role == Role::Leader {
+            let next = self.last_index() + 1;
+            for peer in self.peers() {
+                self.next_index.entry(peer).or_insert(next);
+                self.match_index.entry(peer).or_insert(0);
+                self.acked_rounds.entry(peer).or_insert(0);
+            }
+        }
+    }
+
+    /// The configuration as of `index`, and the index of the entry that set it (0 if it came
+    /// from the snapshot or is the initial one).
+    fn members_at(&self, index: u64) -> (Vec<NodeId>, u64) {
+        let base = self.durable.snapshot.index;
+        for i in (base + 1..=index.min(self.last_index())).rev() {
+            if let Some(members) = self.durable.entry(i).and_then(|e| e.config.clone()) {
+                return (members, i);
+            }
+        }
+        let snapshot = self.durable.snapshot.members.clone();
+        (snapshot.unwrap_or_else(|| self.config.members.clone()), 0)
+    }
+
+    /// Votes received from members of the current configuration.
+    fn member_votes(&self) -> usize {
+        self.votes.iter().filter(|v| self.members.contains(v)).count()
     }
 
     fn reset_election_timer(&mut self, ctx: &mut RaftContext<'_>) {
@@ -855,11 +1061,11 @@ impl Raft {
     }
 
     fn peers(&self) -> Vec<NodeId> {
-        self.config.members.iter().copied().filter(|&m| m != self.id).collect()
+        self.members.iter().copied().filter(|&m| m != self.id).collect()
     }
 
     fn majority(&self) -> usize {
-        self.config.members.len() / 2 + 1
+        self.members.len() / 2 + 1
     }
 
     fn last_index(&self) -> u64 {

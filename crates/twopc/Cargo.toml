@@ -1,0 +1,13 @@
+[package]
+name = "twopc"
+description = "A second system under test: two-phase commit with durable votes and decisions, its checker and planted bugs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sim-api = { workspace = true }
+sim-core = { workspace = true }
+
+[lints]
+workspace = true

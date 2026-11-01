@@ -26,6 +26,8 @@ pub struct Snapshot {
     pub term: u64,
     /// The state machine, encoded by the host.
     pub data: Vec<u8>,
+    /// The cluster configuration as of `index`; `None` while it is still the initial one.
+    pub members: Option<Vec<NodeId>>,
 }
 
 /// Raft's persistent state (Figure 2): the current term, the vote, and the log, mirrored on disk.
@@ -118,11 +120,10 @@ impl Durable {
         // damage destroy it, the previous one's log file is still intact, just shorter, and the
         // log-end check below notices.
         let records = read_valid(storage, SNAPSHOT_FILE)?;
-        let well_formed = records.iter().filter(|r| r.len() >= 33 && r[16] <= 1);
-        if let Some(r) = well_formed.max_by_key(|r| read_u64(r)) {
-            let (index, term) = (read_u64(r), read_u64(&r[8..]));
-            self.snapshot = Snapshot { index, term, data: r[33..].to_vec() };
-            self.log_file = usize::from(r[16]);
+        let well_formed = records.iter().filter_map(|r| decode_snapshot(r).map(|s| (r, s)));
+        if let Some((r, (snapshot, data_start))) = well_formed.max_by_key(|(r, _)| read_u64(r)) {
+            self.snapshot = Snapshot { data: r[data_start..].to_vec(), ..snapshot };
+            self.log_file = usize::from(r[16] & 1);
             self.switched_end = (read_u64(&r[17..]), read_u64(&r[25..]));
         }
         Ok(())
@@ -141,8 +142,7 @@ impl Durable {
             if payload.len() < 16 || read_u64(&payload) != self.last_index() + 1 {
                 break;
             }
-            let term = read_u64(&payload[8..]);
-            self.log.push(Entry { term, data: payload[16..].to_vec() });
+            self.log.push(decode_entry(&payload));
             end += (record::HEADER_LEN + payload.len()) as u64;
             self.ends.push(end);
         }
@@ -302,9 +302,14 @@ impl Durable {
             (snapshot.index + tail.len() as u64, tail.last().map_or(snapshot.term, |e| e.term));
         let mut payload = snapshot.index.to_le_bytes().to_vec();
         payload.extend(snapshot.term.to_le_bytes());
-        payload.push(file as u8);
+        // The log file number (0 or 1), with the top bit set when a configuration follows the
+        // fixed fields (records without one read exactly as before).
+        payload.push(file as u8 | if snapshot.members.is_some() { CONFIG_FLAG } else { 0 });
         payload.extend(switched_end.0.to_le_bytes());
         payload.extend(switched_end.1.to_le_bytes());
+        if let Some(members) = &snapshot.members {
+            payload.extend(encode_members(members));
+        }
         payload.extend(&snapshot.data);
         storage.append(SNAPSHOT_FILE, &record::encode(&payload));
         storage.sync(SNAPSHOT_FILE)?;
@@ -322,8 +327,18 @@ fn encode_entries(entries: &[Entry], first: u64, start: u64, ends: &mut Vec<u64>
     let mut bytes = Vec::new();
     for (index, entry) in (first..).zip(entries) {
         let mut payload = index.to_le_bytes().to_vec();
-        payload.extend(entry.term.to_le_bytes());
-        payload.extend(&entry.data);
+        match &entry.config {
+            None => {
+                payload.extend(entry.term.to_le_bytes());
+                payload.extend(&entry.data);
+            }
+            // A configuration entry: the term's top bit marks it (terms never get that high), and
+            // the member list takes the place of the data. Data entries are stored as before.
+            Some(members) => {
+                payload.extend((entry.term | CONFIG_TERM_BIT).to_le_bytes());
+                payload.extend(encode_members(members));
+            }
+        }
         bytes.extend(record::encode(&payload));
         ends.push(start + bytes.len() as u64);
     }
@@ -345,6 +360,59 @@ fn decode_meta(payload: &[u8]) -> Meta {
 
 fn read_u64(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"))
+}
+
+/// Marks a configuration entry in the term field of its log record.
+const CONFIG_TERM_BIT: u64 = 1 << 63;
+/// Marks a snapshot record that carries a configuration.
+const CONFIG_FLAG: u8 = 0x80;
+
+/// A member list: its length, then each id.
+fn encode_members(members: &[NodeId]) -> Vec<u8> {
+    let mut bytes = vec![u8::try_from(members.len()).expect("at most 255 members")];
+    for m in members {
+        bytes.extend(m.0.to_le_bytes());
+    }
+    bytes
+}
+
+/// The member list at the start of `bytes`, and where it ends.
+fn decode_members(bytes: &[u8]) -> Option<(Vec<NodeId>, usize)> {
+    let count = usize::from(*bytes.first()?);
+    let members = (0..count)
+        .map(|i| {
+            let at = 1 + 4 * i;
+            Some(NodeId(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?)))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((members, 1 + 4 * count))
+}
+
+/// A log record's entry (the caller has checked the index).
+fn decode_entry(payload: &[u8]) -> Entry {
+    let term = read_u64(&payload[8..]);
+    if term & CONFIG_TERM_BIT != 0
+        && let Some((members, _)) = decode_members(&payload[16..])
+    {
+        return Entry { term: term & !CONFIG_TERM_BIT, data: Vec::new(), config: Some(members) };
+    }
+    Entry { term, data: payload[16..].to_vec(), config: None }
+}
+
+/// A snapshot record's fixed fields and configuration (data left empty), and where its data
+/// starts; `None` if the record is not well formed.
+fn decode_snapshot(r: &[u8]) -> Option<(Snapshot, usize)> {
+    if r.len() < 33 || r[16] & !CONFIG_FLAG > 1 {
+        return None;
+    }
+    let (index, term) = (read_u64(r), read_u64(&r[8..]));
+    let (members, data_start) = if r[16] & CONFIG_FLAG != 0 {
+        let (members, len) = decode_members(&r[33..])?;
+        (Some(members), 33 + len)
+    } else {
+        (None, 33)
+    };
+    Some((Snapshot { index, term, data: Vec::new(), members }, data_start))
 }
 
 /// Reads a file's valid records and cuts off any torn or garbage tail, so that later appends land
@@ -396,7 +464,7 @@ mod tests {
     }
 
     fn entry(term: u64, byte: u8) -> Entry {
-        Entry { term, data: vec![byte; 10] }
+        Entry { term, data: vec![byte; 10], config: None }
     }
 
     /// Term 3, voted for n1, five entries written in two batches.
@@ -507,7 +575,7 @@ mod tests {
     }
 
     fn snapshot(index: u64, term: u64) -> Snapshot {
-        Snapshot { index, term, data: vec![index as u8; 4] }
+        Snapshot { index, term, data: vec![index as u8; 4], members: None }
     }
 
     #[test]

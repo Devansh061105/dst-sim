@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 checker = { workspace = true }
 harness = { workspace = true }
+twopc = { workspace = true }
 kv = { workspace = true }
 sim-core = { workspace = true }
 clap = { workspace = true }

@@ -8,11 +8,14 @@ run reproducible from a single 64-bit seed. The system under test is a Raft-repl
 store with snapshots and linearizable reads. Every run is checked step by step against Raft's
 safety properties and, at the end, for linearizability. A failing run shrinks to a minimal
 scenario that opens in a trace viewer, and the same Raft code also runs as real processes over
-TCP.
+TCP. The cluster can add and remove servers while it runs, a second system under test (two-phase
+commit) shows the framework isn't tied to Raft, state coverage measures how much behaviour a
+campaign explored, and nodes can also be written as `async` functions.
 
-> **Status:** complete through milestone M8 (simulator, faults, Raft KV, linearizability
+> **Status:** complete through milestone M9 (simulator, faults, Raft KV, linearizability
 > checking, bug-hunting CLI, shrinking, trace viewer, disk corruption, ReadIndex, snapshots, real
-> mode). See [docs/ROADMAP.md](docs/ROADMAP.md) and the [bug museum](docs/BUG_MUSEUM.md).
+> mode, membership changes, two-phase commit, state coverage, async nodes). See
+> [docs/ROADMAP.md](docs/ROADMAP.md) and the [bug museum](docs/BUG_MUSEUM.md).
 
 ## Results
 
@@ -52,6 +55,30 @@ Determinism: the same seed gives a bit-identical trace, verified on Linux and Wi
 push runs a 10,000-seed chaos sweep and a 2,000-seed swarm sweep; a nightly job sweeps 200,000
 swarm seeds it has never run before (about 350 simulated cluster-hours).
 
+**Membership changes.** An admin adds and removes servers (5 in the pool, at least 3 members)
+while clients run: correct code passes **300,000 runs** (100,000 each of calm, chaos and swarm).
+The changes are real: 954 of 1,000 chaos runs end in a different configuration, and together they
+reach all 16 possible ones. Runs without membership changes are untouched by the feature:
+50,000 chaos and 50,000 swarm seeds give exactly the same event and fault totals as before it
+existed, and every sampled run the same trace hash.
+
+**A second system under test.** Two-phase commit (a coordinator and three participants, 50
+transactions per run, durable votes and decisions) runs on the same simulator and `dst` sweeps
+with its own checker: **100,000 chaos and 100,000 swarm seeds pass** (926 simulated
+cluster-hours).
+
+**State coverage.** Each step's cluster state is reduced to an abstract shape and hashed;
+coverage-guided campaigns keep the fault mixes that reached new shapes and mutate them, as a
+fuzzer keeps inputs. Over 20,000 swarm runs, averaged over four campaign seeds:
+
+| | Plain swarm | Coverage-guided |
+|---|---|---|
+| Distinct abstract states | ≈19,600 | ≈23,100 (+18%; plain's total is reached in about 12,000 runs) |
+| Runs catching `snapshot-without-sessions` | ≈47 | ≈76 (1.6x) |
+
+For the other rare bugs (`commit-beyond-match`, `read-without-quorum`, `forget-vote`) the two
+found about as many failures: more states explored doesn't automatically mean more bugs.
+
 ![Trace viewer showing a shrunk failure](docs/viewer.png)
 
 *A shrunk failure in the trace viewer (`dst run --html`): nodes are lanes, arrows are messages
@@ -78,6 +105,24 @@ mean number of seeds needed to catch it, measured over 10,000 seeds per bug with
 | Leader commits earlier-term entries by counting replicas (Figure 8) | not yet | not yet | Raft invariants, targeted scenario |
 | Truncate and append share one `fsync` | not yet | not yet | Raft invariants, targeted scenario |
 
+*Membership changes* (`dst bugs --system membership`, runs in which an admin adds and removes
+servers):
+
+| Bug | Chaos | Swarm | Caught by |
+|---|---|---|---|
+| Servers decide with the committed configuration instead of the latest one | 41 | 43 | Raft invariants |
+| A change starts before the previous one has committed | 270 | 833 | Raft invariants |
+| A new leader changes the configuration before committing in its own term (the 2015 bug) | not yet | not yet | Raft invariants, targeted scenario |
+
+*Two-phase commit* (`dst bugs --system 2pc`):
+
+| Bug | Chaos | Swarm | Caught by |
+|---|---|---|---|
+| The coordinator commits once a majority voted yes | 1.0 | 1.0 | validity |
+| A participant that voted yes gives up and aborts on its own | 1.0 | 1.1 | atomicity |
+| Participants answer before their vote is synced | 1.9 | 1.5 | durability |
+| The coordinator sends a decision it has not synced | 6.5 | 10.2 | atomicity |
+
 The rare ones need a precise sequence: a deposed leader still serving a read after a new leader
 took a write, a vote request re-delivered after the voter restarted, Figure 8 of the Raft paper.
 Swarm and chaos complement each other. The last two never showed up in random runs, so each has
@@ -93,6 +138,11 @@ on every seed while correct Raft passes (`cargo test -p harness --test cluster`)
   the truncate and the append, with the append on disk and the truncate not. After the restart
   its log is the new entry followed by the stale tail (Log Matching fails). With the truncate
   synced on its own, the same crash changes nothing on disk.
+- *The 2015 membership bug* (found by Diego Ongaro in Raft's original single-server changes): a
+  leader's change reaches only the new server; a new leader removes a server before committing
+  in its own term; the old leader returns and, under its own uncommitted configuration, wins
+  with a different majority and lacks the committed removal (`cargo test -p harness --test
+  membership`). Never seen in 200,000 random runs.
 
 **The corruption defence is necessary.** With the per-node check relaxed, trusting a damaged log
 leads to real cluster-wide failures (a leader elected without an already committed entry, in 14
@@ -114,6 +164,13 @@ with its seed, cause and fix. Some highlights:
   a torn write. Log length now lives in a separate file.
 - A cut-off node won an *older* term through delayed votes after a newer term had committed an
   entry it lacked. Raft allows that; the invariant checker was too strict.
+- In the two-phase commit system, recovery cut a torn tail off the log but didn't sync the cut
+  before appending. A crash kept the append and lost the cut; the new record exactly filled the
+  gap, bringing an old, never-sent commit decision back to life (the same class of mistake as a
+  planted Raft bug). 7 of 200,000 seeds.
+- With membership changes, a server just added still believed the initial configuration and
+  ignored the real leader's vote requests: the cluster never elected anyone. Servers now ignore
+  outsiders only while they hear from a live leader (Raft thesis §4.2.3).
 
 ## How it works
 
@@ -195,13 +252,45 @@ ends the fault period earlier, keeping each change only if the run still fails t
 Over 42 failing seeds (up to five per planted bug) it took 0.1–2 s and about 110 simulations
 each. Faults fell 3x at the median (618 → 213 in total; 11 runs needed no faults at all, and
 81 → 7 and 18 → 1 were among the best), while event counts fell only 1.3x at the median (6.3x at
-best), because with fewer faults a failure can take longer to show. Rare, timing-sensitive failures shrink least: deleting any
-fault changes every later interleaving. The output is a small text scenario file that
+best), because with fewer faults a failure can take longer to show. Rare, timing-sensitive
+failures shrink least: deleting any fault changes every later interleaving. The output is a small text scenario file that
 `dst run --scenario` replays.
 
 **Trace viewer.** `dst run --html run.html` writes a single self-contained page (no dependencies)
 with the run built in: a space-time diagram on a canvas, zoom and pan, hover for any event, the
 operations of a non-linearizable key outlined in red.
+
+**Membership changes.** Single-server changes (Raft thesis §4.1): a configuration is a log entry,
+and every server uses the latest one in its log, committed or not. A leader starts a change only
+after the previous one has committed and after committing an entry of its own term; majorities,
+elections, replication and read confirmation all count members only. A leader that removed itself
+steps down once that commits; a server outside its latest configuration may still campaign while
+that configuration is uncommitted (it may hold entries the others need). Servers ignore vote
+requests from outsiders while a leader is alive, so a removed server can't disrupt the cluster.
+Configurations survive snapshots. The on-disk format marks configuration entries with a spare
+bit, so runs without membership changes write exactly the same bytes as before.
+
+**Two-phase commit.** Participants sync their vote before answering; the coordinator syncs its
+decision before sending it and logs a *done* record once everyone acknowledged it. After a crash
+the coordinator resends every decision without a done record and *presumes abort* for the
+transaction it may have been preparing. Its checker, run after every step: atomicity (no
+transaction both committed and aborted, no node changing its mind), validity (commit only with
+every vote yes), durability (no node forgets a vote or decision after a restart), and at the end
+every transaction decided everywhere.
+
+**State coverage.** A step's abstract state is each server's role, whether it is up, whether its
+term, log and commit index lag behind the most advanced server, and whether it is repairing disk
+damage; sorted, so that states differing only in which server is which count once. `dst coverage`
+runs a campaign of swarm runs and reports distinct states over time; `--guided` spends 80% of runs
+on fault mixes from a corpus of mixes that found something new, often with one fault type
+switched on or off. Batches run on every core and the corpus updates between them in run order,
+so a campaign replays exactly from its seed.
+
+**Async nodes.** `sim-async` runs a node written as one `async` function on the unchanged
+simulator: a no-op waker, one task per node, and an `Io` handle whose sends and timers are queued
+and applied after each poll. A retrying echo protocol written both ways ends at the same virtual
+time, after the same number of steps, with the same message statistics, for every seed under
+chaos.
 
 ## Try it
 
@@ -229,6 +318,14 @@ cargo build --release -p dst-cli
 # The planted-bug table above
 ./target/release/dst bugs --seeds 10000 --mode chaos
 
+# Membership changes and two-phase commit, the same way
+./target/release/dst sweep --system membership --seeds 0..100000 --mode swarm
+./target/release/dst bugs --system 2pc --seeds 10000 --mode chaos
+
+# State coverage: plain swarm against coverage-guided
+./target/release/dst coverage --runs 20000
+./target/release/dst coverage --runs 20000 --guided
+
 # A real cluster: three servers and a client on localhost (one terminal each)
 ./target/release/dst serve --id 0 --nodes 7000-7003 --data data/n0
 ./target/release/dst serve --id 1 --nodes 7000-7003 --data data/n1
@@ -239,7 +336,10 @@ cargo build --release -p dst-cli
 Modes: `calm` (no faults), `chaos` (every fault, fixed intensity), `swarm` (random mix per seed).
 Bugs: `local-reads`, `vote-without-log-check`, `forget-vote`, `truncate-without-conflict`,
 `commit-beyond-match`, `skip-append-fsync`, `commit-old-terms`, `single-sync-truncate`,
-`trust-damaged-log`, `read-without-quorum`, `snapshot-without-sessions`.
+`trust-damaged-log`, `read-without-quorum`, `snapshot-without-sessions`. With `--system
+membership`: `concurrent-changes`, `change-before-commit-in-term`, `use-committed-config`. With
+`--system 2pc`: `commit-on-majority`, `vote-without-fsync`, `decision-not-synced`,
+`abort-after-yes-timeout`.
 
 ## Layout
 
@@ -249,12 +349,14 @@ Bugs: `local-reads`, `vote-without-log-check`, `forget-vote`, `truncate-without-
 | `sim-core` | Simulator: RNG streams, event queue, step loop, nemesis and fault scripts, clocks, trace |
 | `sim-net` | Network fault model |
 | `sim-disk` | Disk fault model with page-cache semantics and corruption |
-| `raft` | Raft consensus with ReadIndex and snapshots, written only against `sim-api`, plus its invariant checker |
-| `kv` | Replicated key-value store, retrying clients, sequential model for checking |
+| `sim-async` | Nodes written as `async` functions: a tiny deterministic executor over `Node` |
+| `raft` | Raft consensus with ReadIndex, snapshots and membership changes, written only against `sim-api`, plus its invariant checker |
+| `kv` | Replicated key-value store, retrying clients, the membership admin, sequential model for checking |
+| `twopc` | Second system under test: two-phase commit, its checker and planted bugs |
 | `checker` | Generic linearizability checker |
-| `harness` | Runs a checked cluster for one seed; scenarios and the shrinker |
+| `harness` | Runs a checked cluster for one seed; scenarios, the shrinker, state coverage |
 | `runtime-real` | The same `Context` over TCP, real files and the real clock |
-| `dst-cli` | `dst` command-line tool: `run`, `sweep`, `bugs`, `shrink`, `serve`, `client` |
+| `dst-cli` | `dst` command-line tool: `run`, `sweep`, `bugs`, `shrink`, `coverage`, `serve`, `client` |
 
 `viewer/index.html` is the trace viewer (it also opens JSON from `dst run --json`).
 `.github/workflows` holds CI (format, lint, tests and docs on Linux and Windows), the seed sweeps,
@@ -270,4 +372,7 @@ and an on-demand CPU flamegraph of a one-thread sweep (`Profile`, run by hand).
 - A. Groce et al., *Swarm Testing*, ISSTA 2012
 - A. Zeller and R. Hildebrandt, *Simplifying and Isolating Failure-Inducing Input* (delta debugging), 2002
 - R. Alagappan et al., *Protocol-Aware Recovery for Consensus-Based Storage*, FAST 2018
+- D. Ongaro, *Bug in single-server membership changes*, raft-dev mailing list, 2015
+- J. Gray, *Notes on Data Base Operating Systems* (two-phase commit), 1978
+- M. Zalewski, *american fuzzy lop* (coverage-guided fuzzing)
 - K. Kingsbury, Jepsen analyses

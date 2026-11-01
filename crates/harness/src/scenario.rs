@@ -77,7 +77,8 @@ impl Knob {
         }
     }
 
-    fn switch_off(self, config: &mut SimConfig) {
+    /// Turns this kind of fault off in `config`.
+    pub fn switch_off(self, config: &mut SimConfig) {
         match self {
             Knob::Loss => config.net.drop = 0.0,
             Knob::Duplication => config.net.duplicate = 0.0,

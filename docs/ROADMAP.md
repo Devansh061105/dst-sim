@@ -20,6 +20,7 @@ Wk:  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16
 | **M6** Bug hunter | 10 | CLI, parallel sweeps, planted-bug suite, swarm testing |
 | **M7** Feature-complete | 13 | Shrinking, trace viewer, snapshots, real mode |
 | **M8** Shipped | 15 | README, metrics, CI, resume bullets |
+| **M9** Stretch | 16+ | Async facade, two-phase commit, state coverage, membership changes |
 
 ---
 
@@ -108,3 +109,17 @@ Wk:  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16
 
 ## Week 16 — Buffer
 Slack for exams, placements and Raft debugging. If unused, start Tier 3 (F24–F28).
+
+## Phase 9 — Stretch features (week 16 onwards) → M9
+- [x] Async facade (F27): deterministic executor, `async` node adapter, a protocol written both
+  ways, determinism tests
+- [x] Two-phase commit (F25): new `twopc` crate (coordinator, participants, durable state,
+  recovery), its own checker and planted bugs, `dst` sweeps and bug table for it
+- [x] State coverage (F26): abstract state hash, distinct states per 1,000 seeds,
+  coverage-guided campaign mode, measured against plain swarm
+- [x] Membership changes (F24): single-server add/remove with the own-term rule, configuration
+  in snapshots, per-configuration majorities, reconfiguration during sweeps, planted bugs (the
+  invariant checker needed no change: its properties don't depend on who the members are)
+
+**Done when:** each feature has tests, passes the usual sweeps (correct code: no failures), its
+planted bugs are caught, and README, this roadmap and PROJECT_PLAN describe it. **M9 met.**

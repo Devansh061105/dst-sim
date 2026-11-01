@@ -33,6 +33,10 @@ pub struct Client {
     target: usize,
     /// The next retry goes to `target` as-is (it came from a hint) instead of the next server.
     redirected: bool,
+    /// Hints followed for the current operation.
+    hints: u32,
+    /// After this many hints for one operation, ignore hints and try servers in turn.
+    max_hints: u32,
     retry_timer: Option<TimerId>,
     /// Latest value this client knows per key, used to pick plausible `Cas` expectations.
     last_seen: BTreeMap<u8, u64>,
@@ -50,10 +54,20 @@ impl Client {
             completed: 0,
             target: 0,
             redirected: false,
+            hints: 0,
+            max_hints: u32::MAX,
             retry_timer: None,
             last_seen: BTreeMap::new(),
             events: Vec::new(),
         }
+    }
+
+    /// Follows at most `max` leader hints per operation, then tries servers in turn. Needed
+    /// when servers are removed from the cluster: they keep stale views and can point at each
+    /// other in a circle. Off by default, which keeps every run without membership changes
+    /// exactly as it was (such runs can also meet a hint cycle, but they always escape it).
+    pub fn with_hint_limit(self, max: u32) -> Self {
+        Client { max_hints: max, ..self }
     }
 
     pub fn is_done(&self) -> bool {
@@ -93,9 +107,12 @@ impl Client {
                 self.next_op(ctx);
             }
             Reply::NotLeader(hint) => {
+                // See `with_hint_limit`.
+                let hint = hint.filter(|_| self.hints < self.max_hints);
                 if let Some(i) = hint.and_then(|h| self.servers.iter().position(|&s| s == h)) {
                     self.target = i;
                     self.redirected = true;
+                    self.hints += 1;
                     self.arm_retry(ctx, REDIRECT);
                 }
                 // Without a hint, the pending retry timer moves on to the next server.
@@ -115,6 +132,7 @@ impl Client {
     }
 
     fn next_op(&mut self, ctx: &mut KvContext<'_>) {
+        self.hints = 0;
         if self.is_done() {
             return;
         }

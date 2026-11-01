@@ -5,14 +5,16 @@
 //! client has finished (liveness), and the history is then checked for linearizability. Tests and
 //! the `dst` command-line tool both run clusters through here.
 
+mod coverage;
 mod scenario;
 mod shrink;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
 use checker::Verdict;
+pub use coverage::abstract_state;
 use kv::{Bugs, ClientEvent, KvModel, Op, OpResult, Recorder, Server};
 use raft::{Checker, Violation};
 pub use scenario::{Knob, Scenario};
@@ -26,6 +28,12 @@ pub const SERVERS: u32 = 5;
 pub const NODES: u32 = 7;
 /// Operations each client performs.
 pub const OPS: u32 = 30;
+/// In a membership run, the configuration starts with this many of the [`SERVERS`].
+pub const INITIAL_MEMBERS: u32 = 3;
+/// Configuration changes the admin makes in a membership run.
+pub const CHANGES: u32 = 6;
+/// Nodes in a membership run: the server pool, the admin and two clients.
+pub const MEMBERSHIP_NODES: u32 = SERVERS + 3;
 
 /// Search steps allowed per key when checking linearizability.
 const CHECK_BUDGET: u64 = 1_000_000;
@@ -189,6 +197,77 @@ impl FromStr for Bug {
     }
 }
 
+/// A planted bug in Raft's membership changes. Only membership runs ([`run_membership`]) can
+/// catch these: without configuration changes the code they break never runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MembershipBug {
+    /// Start a change before the previous one has committed.
+    ConcurrentChanges,
+    /// Change the configuration before committing an entry of the leader's own term.
+    ChangeBeforeCommitInTerm,
+    /// Decide with the latest committed configuration instead of the latest one in the log.
+    UseCommittedConfig,
+}
+
+impl MembershipBug {
+    /// Every membership bug.
+    pub const ALL: [MembershipBug; 3] = [
+        MembershipBug::ConcurrentChanges,
+        MembershipBug::ChangeBeforeCommitInTerm,
+        MembershipBug::UseCommittedConfig,
+    ];
+
+    /// Its command-line name.
+    pub fn name(self) -> &'static str {
+        match self {
+            MembershipBug::ConcurrentChanges => "concurrent-changes",
+            MembershipBug::ChangeBeforeCommitInTerm => "change-before-commit-in-term",
+            MembershipBug::UseCommittedConfig => "use-committed-config",
+        }
+    }
+
+    /// One line on what goes wrong.
+    pub fn description(self) -> &'static str {
+        match self {
+            MembershipBug::ConcurrentChanges => "a change starts before the previous one commits",
+            MembershipBug::ChangeBeforeCommitInTerm => {
+                "a new leader changes the configuration before committing in its own term"
+            }
+            MembershipBug::UseCommittedConfig => {
+                "servers use the committed configuration instead of the latest one"
+            }
+        }
+    }
+
+    /// The switch that plants it.
+    pub fn bugs(self) -> Bugs {
+        let mut raft = raft::Bugs::default();
+        match self {
+            MembershipBug::ConcurrentChanges => raft.concurrent_changes = true,
+            MembershipBug::ChangeBeforeCommitInTerm => raft.change_before_commit_in_term = true,
+            MembershipBug::UseCommittedConfig => raft.use_committed_config = true,
+        }
+        Bugs { raft, ..Bugs::default() }
+    }
+}
+
+impl fmt::Display for MembershipBug {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl FromStr for MembershipBug {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        MembershipBug::ALL.into_iter().find(|b| b.name() == s).ok_or_else(|| {
+            let names: Vec<_> = MembershipBug::ALL.iter().map(|b| b.name()).collect();
+            format!("unknown membership bug {s:?} (expected one of: {})", names.join(", "))
+        })
+    }
+}
+
 /// One client operation, with the virtual times it was invoked and completed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpRecord {
@@ -224,6 +303,9 @@ pub struct Outcome {
     pub ops: Vec<OpRecord>,
     /// Every event, if the run kept them.
     pub trace: Option<Vec<TraceEvent>>,
+    /// The abstract states the run went through (see [`abstract_state`]); empty unless asked
+    /// for with [`run_cluster_with_coverage`].
+    pub states: BTreeSet<u64>,
 }
 
 impl Outcome {
@@ -296,8 +378,51 @@ pub fn run_seed(mode: Mode, seed: u64, bug: Option<Bug>, keep_trace: bool) -> Ou
 /// Runs a cluster of `servers` servers; every other node in `config` is a client doing
 /// `ops_per_client` operations.
 pub fn run_cluster(config: SimConfig, servers: u32, ops_per_client: u32, bugs: Bugs) -> Outcome {
+    run(config, servers, ops_per_client, bugs, false)
+}
+
+/// [`run_cluster`], also recording the abstract states the cluster passes through.
+pub fn run_cluster_with_coverage(
+    config: SimConfig,
+    servers: u32,
+    ops_per_client: u32,
+    bugs: Bugs,
+) -> Outcome {
+    run(config, servers, ops_per_client, bugs, true)
+}
+
+/// A run in which the cluster's membership changes: [`SERVERS`] servers of which
+/// [`INITIAL_MEMBERS`] start as the configuration, an admin that makes [`CHANGES`] changes
+/// (adding or removing one server each), and two clients. The run must also let the admin
+/// finish.
+pub fn run_membership(mode: Mode, seed: u64, bug: Option<MembershipBug>) -> Outcome {
+    let mut config = mode.config_for(seed, MEMBERSHIP_NODES);
+    // The configuration can shrink to INITIAL_MEMBERS servers, which survive only a minority of
+    // them losing data.
+    config.faults.max_corrupted = config.faults.max_corrupted.min((INITIAL_MEMBERS - 1) / 2);
+    let bugs = bug.map(MembershipBug::bugs).unwrap_or_default();
+    let nodes = kv::cluster_with_membership(SERVERS, INITIAL_MEMBERS, CHANGES, OPS, bugs);
+    run_nodes(config, nodes, false)
+}
+
+fn run(
+    config: SimConfig,
+    servers: u32,
+    ops_per_client: u32,
+    bugs: Bugs,
+    coverage: bool,
+) -> Outcome {
+    run_nodes(config, kv::cluster_with_bugs(servers, ops_per_client, bugs), coverage)
+}
+
+fn run_nodes(
+    config: SimConfig,
+    nodes: impl FnMut(NodeId) -> kv::KvNode + 'static,
+    coverage: bool,
+) -> Outcome {
     let seed = config.seed;
-    let mut sim = Simulation::new(config, kv::cluster_with_bugs(servers, ops_per_client, bugs));
+    let mut states = BTreeSet::new();
+    let mut sim = Simulation::new(config, nodes);
     let clients: Vec<_> =
         sim.nodes().filter(|(_, n)| n.as_client().is_some()).map(|(id, _)| id).collect();
     let mut checker = Checker::new();
@@ -338,6 +463,12 @@ pub fn run_cluster(config: SimConfig, servers: u32, ops_per_client: u32, bugs: B
             violation = Some(v);
             break;
         }
+        if coverage {
+            let rafts = sim
+                .nodes()
+                .filter_map(|(id, n)| n.as_server().map(|s| sim.is_up(id).then(|| s.raft())));
+            states.insert(abstract_state(rafts));
+        }
         // Rejoining (no votes until caught up) is only right after real damage; a false alarm
         // would quietly cost the cluster a voter, and show up much later as lost liveness.
         false_alarm = sim
@@ -348,9 +479,13 @@ pub fn run_cluster(config: SimConfig, servers: u32, ops_per_client: u32, bugs: B
         if false_alarm.is_some() {
             break;
         }
+        // Clients, and the admin if there is one, must all have finished.
         clients_done = sim
             .nodes()
-            .filter_map(|(id, n)| n.as_client().map(|c| sim.is_up(id) && c.is_done()))
+            .filter_map(|(id, n)| {
+                let done = n.as_client().map(|c| c.is_done()).or(n.as_admin().map(|a| a.is_done()));
+                done.map(|done| done && sim.is_up(id))
+            })
             .all(|done| done);
         if clients_done {
             break;
@@ -373,6 +508,7 @@ pub fn run_cluster(config: SimConfig, servers: u32, ops_per_client: u32, bugs: B
         script: sim.script(),
         ops,
         trace: sim.trace().events().map(<[TraceEvent]>::to_vec),
+        states,
     }
 }
 

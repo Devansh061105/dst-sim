@@ -5,7 +5,7 @@ use sim_api::NodeId;
 use sim_api::wire::{Reader, put_u32, put_u64};
 
 use crate::command::{Op, OpResult, RequestId};
-use crate::{KvMsg, Reply};
+use crate::{Change, KvMsg, ReconfigReply, Reply};
 
 impl KvMsg {
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -34,6 +34,32 @@ impl KvMsg {
                     }
                 }
             }
+            KvMsg::Reconfigure { id, change } => {
+                out.push(3);
+                put_u64(&mut out, *id);
+                let (kind, server) = match change {
+                    Change::Add(s) => (0, s),
+                    Change::Remove(s) => (1, s),
+                };
+                out.push(kind);
+                put_u32(&mut out, server.0);
+            }
+            KvMsg::Reconfigured { id, reply, members } => {
+                out.push(4);
+                put_u64(&mut out, *id);
+                match reply {
+                    ReconfigReply::Accepted => out.push(0),
+                    ReconfigReply::Busy => out.push(1),
+                    ReconfigReply::NotLeader(hint) => {
+                        out.push(2);
+                        put_u32(&mut out, hint.map_or(u32::MAX, |n| n.0));
+                    }
+                }
+                put_u32(&mut out, members.len() as u32);
+                for m in members {
+                    put_u32(&mut out, m.0);
+                }
+            }
         }
         out
     }
@@ -52,6 +78,32 @@ impl KvMsg {
                     _ => return None,
                 };
                 KvMsg::Response { id, reply }
+            }
+            3 => {
+                let id = r.u64()?;
+                let change = match (r.u8()?, NodeId(r.u32()?)) {
+                    (0, server) => Change::Add(server),
+                    (1, server) => Change::Remove(server),
+                    _ => return None,
+                };
+                KvMsg::Reconfigure { id, change }
+            }
+            4 => {
+                let id = r.u64()?;
+                let reply = match r.u8()? {
+                    0 => ReconfigReply::Accepted,
+                    1 => ReconfigReply::Busy,
+                    2 => ReconfigReply::NotLeader(
+                        Some(r.u32()?).filter(|&n| n != u32::MAX).map(NodeId),
+                    ),
+                    _ => return None,
+                };
+                let count = r.u32()?;
+                let mut members = Vec::new();
+                for _ in 0..count {
+                    members.push(NodeId(r.u32()?));
+                }
+                KvMsg::Reconfigured { id, reply, members }
             }
             _ => return None,
         };
@@ -149,6 +201,14 @@ mod tests {
             KvMsg::Response { id, reply: Reply::Done(OpResult::Cas { swapped: true }) },
             KvMsg::Response { id, reply: Reply::NotLeader(None) },
             KvMsg::Response { id, reply: Reply::NotLeader(Some(NodeId(2))) },
+            KvMsg::Reconfigure { id: 7, change: Change::Add(NodeId(3)) },
+            KvMsg::Reconfigure { id: 8, change: Change::Remove(NodeId(0)) },
+            KvMsg::Reconfigured { id: 7, reply: ReconfigReply::Accepted, members: vec![NodeId(1)] },
+            KvMsg::Reconfigured {
+                id: 9,
+                reply: ReconfigReply::NotLeader(Some(NodeId(4))),
+                members: vec![],
+            },
         ];
         for msg in messages {
             let bytes = msg.to_bytes();

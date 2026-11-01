@@ -9,13 +9,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+mod coverage;
 mod real;
 mod viewer;
 
 use clap::{Parser, Subcommand};
 use std::path::Path;
 
-use harness::{Bug, Mode, Scenario, run_seed};
+use harness::{Bug, MembershipBug, Mode, Scenario, run_membership, run_seed};
 use rayon::prelude::*;
 use sim_core::Stats;
 
@@ -70,10 +71,15 @@ enum Command {
         /// Seeds to run, as START..END
         #[arg(long, default_value = "0..1000", value_parser = parse_range)]
         seeds: Range<u64>,
+        /// The system under test: raft (the key-value store), membership (the same store while
+        /// servers are added and removed) or 2pc (two-phase commit)
+        #[arg(long, default_value = "raft")]
+        system: System,
         #[arg(long, default_value = "chaos")]
         mode: Mode,
+        /// Plant a bug of that system (see `dst bugs --system ...`)
         #[arg(long)]
-        bug: Option<Bug>,
+        bug: Option<String>,
         /// Worker threads (default: one per CPU core)
         #[arg(long)]
         jobs: Option<usize>,
@@ -86,8 +92,29 @@ enum Command {
         /// Seeds to try per bug
         #[arg(long, default_value_t = 1000)]
         seeds: u64,
+        /// raft, membership or 2pc
+        #[arg(long, default_value = "raft")]
+        system: System,
         #[arg(long, default_value = "chaos")]
         mode: Mode,
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
+    /// Measure state coverage: how many distinct abstract cluster states a campaign of runs
+    /// explores, either plain swarm testing or coverage-guided.
+    Coverage {
+        /// Runs in the campaign
+        #[arg(long, default_value_t = 10_000)]
+        runs: u64,
+        /// Keep the fault mixes of runs that found new states and mutate them, like a fuzzer
+        #[arg(long)]
+        guided: bool,
+        /// Plant a bug and count how many runs catch it
+        #[arg(long)]
+        bug: Option<Bug>,
+        /// Seed of the campaign itself (which fault mixes it tries)
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
         #[arg(long)]
         jobs: Option<usize>,
     },
@@ -142,10 +169,22 @@ fn main() -> ExitCode {
             let out = out.unwrap_or_else(|| PathBuf::from(format!("shrunk-{seed}.txt")));
             shrink_seed(&Scenario::new(mode, seed, bug), &out)
         }
-        Command::Sweep { seeds, mode, bug, jobs, failures } => {
-            pool(jobs).install(|| sweep(seeds, mode, bug, &failures))
+        Command::Sweep { seeds, system, mode, bug, jobs, failures } => {
+            let bug = match bug.map(|b| Planted::parse(system, &b)).transpose() {
+                Ok(bug) => bug,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            pool(jobs).install(|| sweep(seeds, system, mode, bug, &failures))
         }
-        Command::Bugs { seeds, mode, jobs } => pool(jobs).install(|| bugs(seeds, mode)),
+        Command::Bugs { seeds, system, mode, jobs } => {
+            pool(jobs).install(|| bugs(seeds, system, mode))
+        }
+        Command::Coverage { runs, guided, bug, seed, jobs } => {
+            pool(jobs).install(|| coverage::campaign(runs, guided, bug, seed))
+        }
         Command::Serve { id, nodes, servers, data } => real::serve(id, nodes, servers, data),
         Command::Client { id, nodes, servers, ops, timeout } => {
             real::client(id, nodes, servers, ops, timeout)
@@ -254,31 +293,165 @@ fn describe(s: &Scenario) -> String {
     format!("seed {} ({}{bug}{scripted})", s.seed, s.mode)
 }
 
-fn sweep(seeds: Range<u64>, mode: Mode, bug: Option<Bug>, failures_path: &PathBuf) -> ExitCode {
+/// Which system under test a command runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum System {
+    /// The Raft key-value store.
+    Raft,
+    /// The same store while an admin adds and removes servers.
+    Membership,
+    /// Two-phase commit.
+    TwoPc,
+}
+
+impl std::str::FromStr for System {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "raft" => Ok(System::Raft),
+            "membership" => Ok(System::Membership),
+            "2pc" | "twopc" => Ok(System::TwoPc),
+            _ => Err(format!("unknown system {s:?} (expected raft, membership or 2pc)")),
+        }
+    }
+}
+
+impl std::fmt::Display for System {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            System::Raft => "raft",
+            System::Membership => "membership",
+            System::TwoPc => "2pc",
+        })
+    }
+}
+
+/// A planted bug of either system.
+#[derive(Clone, Copy, Debug)]
+enum Planted {
+    Raft(Bug),
+    Membership(MembershipBug),
+    TwoPc(twopc::Bug),
+}
+
+impl Planted {
+    fn parse(system: System, name: &str) -> Result<Self, String> {
+        match system {
+            System::Raft => name.parse().map(Planted::Raft),
+            System::Membership => name.parse().map(Planted::Membership),
+            System::TwoPc => name.parse().map(Planted::TwoPc),
+        }
+    }
+
+    fn all(system: System) -> Vec<Planted> {
+        match system {
+            System::Raft => Bug::ALL.into_iter().map(Planted::Raft).collect(),
+            System::Membership => MembershipBug::ALL.into_iter().map(Planted::Membership).collect(),
+            System::TwoPc => twopc::Bug::ALL.into_iter().map(Planted::TwoPc).collect(),
+        }
+    }
+
+    fn raft(self) -> Option<Bug> {
+        match self {
+            Planted::Raft(b) => Some(b),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Planted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Planted::Raft(b) => b.fmt(f),
+            Planted::Membership(b) => b.fmt(f),
+            Planted::TwoPc(b) => b.fmt(f),
+        }
+    }
+}
+
+/// What a sweep needs from one run, whichever system it was.
+struct SeedRun {
+    failure: Option<String>,
+    kind: Option<&'static str>,
+    stats: Stats,
+    end_ns: u64,
+    events: u64,
+}
+
+fn run_one(system: System, mode: Mode, seed: u64, bug: Option<Planted>) -> SeedRun {
+    match system {
+        System::Raft => {
+            let o = run_seed(mode, seed, bug.and_then(Planted::raft), false);
+            SeedRun {
+                failure: o.failure(),
+                kind: o.failure_kind(),
+                stats: o.stats,
+                end_ns: o.end_time.as_nanos(),
+                events: o.events,
+            }
+        }
+        System::Membership => {
+            let bug = match bug {
+                Some(Planted::Membership(b)) => Some(b),
+                _ => None,
+            };
+            let o = run_membership(mode, seed, bug);
+            SeedRun {
+                failure: o.failure(),
+                kind: o.failure_kind(),
+                stats: o.stats,
+                end_ns: o.end_time.as_nanos(),
+                events: o.events,
+            }
+        }
+        System::TwoPc => {
+            let bugs = match bug {
+                Some(Planted::TwoPc(b)) => b.bugs(),
+                _ => twopc::Bugs::default(),
+            };
+            let o = twopc::run(mode.config_for(seed, twopc::NODES), bugs);
+            SeedRun {
+                failure: o.failure(),
+                kind: o.failure_kind(),
+                stats: o.stats,
+                end_ns: o.end_time.as_nanos(),
+                events: o.events,
+            }
+        }
+    }
+}
+
+fn sweep(
+    seeds: Range<u64>,
+    system: System,
+    mode: Mode,
+    bug: Option<Planted>,
+    failures_path: &PathBuf,
+) -> ExitCode {
     let started = Instant::now();
-    let results: Vec<(u64, Option<String>, Stats, u64, u64)> = seeds
+    let results: Vec<(u64, SeedRun)> = seeds
         .clone()
         .into_par_iter()
-        .map(|seed| {
-            let outcome = run_seed(mode, seed, bug, false);
-            (seed, outcome.failure(), outcome.stats, outcome.end_time.as_nanos(), outcome.events)
-        })
+        .map(|seed| (seed, run_one(system, mode, seed, bug)))
         .collect();
     let elapsed = started.elapsed().as_secs_f64().max(1e-9);
 
     let mut total = Stats::default();
     let (mut simulated_ns, mut events) = (0u64, 0u64);
-    for (_, _, stats, end, n) in &results {
-        total += *stats;
-        simulated_ns += end;
-        events += n;
+    for (_, run) in &results {
+        total += run.stats;
+        simulated_ns += run.end_ns;
+        events += run.events;
     }
     let failures: Vec<_> =
-        results.iter().filter_map(|(s, f, ..)| f.as_ref().map(|f| (*s, f))).collect();
+        results.iter().filter_map(|(s, r)| r.failure.as_ref().map(|f| (*s, f))).collect();
     let count = seeds.end.saturating_sub(seeds.start);
     let threads = rayon::current_num_threads();
+    let system_name = if system == System::Raft { String::new() } else { format!("{system}, ") };
     println!(
-        "{count} seeds ({mode}{}) in {elapsed:.1} s on {threads} threads: {:.0} seeds/s",
+        "{count} seeds ({system_name}{mode}{}) in {elapsed:.1} s on {threads} threads: {:.0} \
+         seeds/s",
         bug.map(|b| format!(", bug {b}")).unwrap_or_default(),
         count as f64 / elapsed,
     );
@@ -308,22 +481,31 @@ fn sweep(seeds: Range<u64>, mode: Mode, bug: Option<Bug>, failures_path: &PathBu
         Ok(()) => println!("failing seeds written to {}", failures_path.display()),
         Err(e) => eprintln!("could not write {}: {e}", failures_path.display()),
     }
-    println!("replay the first: {}", dst_command("run", failures[0].0, mode, bug, " --trace"));
+    let first = failures[0].0;
+    match system {
+        System::Raft => {
+            let bug = bug.and_then(Planted::raft);
+            println!("replay the first: {}", dst_command("run", first, mode, bug, " --trace"));
+        }
+        System::Membership | System::TwoPc => println!(
+            "replay the first: cargo run --release -p dst-cli -- sweep --system {system} --mode \
+             {mode} --seeds {first}..{}{}",
+            first + 1,
+            bug.map(|b| format!(" --bug {b}")).unwrap_or_default()
+        ),
+    }
     ExitCode::FAILURE
 }
 
-fn bugs(seeds: u64, mode: Mode) -> ExitCode {
-    println!("Seeds to detect each planted bug ({mode} mode, {seeds} seeds each):\n");
+fn bugs(seeds: u64, system: System, mode: Mode) -> ExitCode {
+    println!("Seeds to detect each planted {system} bug ({mode} mode, {seeds} seeds each):\n");
     println!("| Bug | First failing seed | Caught in | Mean seeds to detect | Caught by |");
     println!("|---|---|---|---|---|");
     let mut all_caught = true;
-    for bug in [None].into_iter().chain(Bug::ALL.map(Some)) {
+    for bug in [None].into_iter().chain(Planted::all(system).into_iter().map(Some)) {
         let failing: Vec<(u64, &'static str)> = (0..seeds)
             .into_par_iter()
-            .filter_map(|seed| {
-                let outcome = run_seed(mode, seed, bug, false);
-                outcome.failure_kind().map(|kind| (seed, kind))
-            })
+            .filter_map(|seed| run_one(system, mode, seed, bug).kind.map(|kind| (seed, kind)))
             .collect();
         let name = bug.map_or_else(|| "(none: correct code)".to_owned(), |b| format!("`{b}`"));
         let caught = failing.len() as u64;

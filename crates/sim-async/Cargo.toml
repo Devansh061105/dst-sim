@@ -1,0 +1,15 @@
+[package]
+name = "sim-async"
+description = "Write a simulated node as one async function: a tiny deterministic executor over the Node trait."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sim-api = { workspace = true }
+
+[dev-dependencies]
+sim-core = { workspace = true }
+
+[lints]
+workspace = true
