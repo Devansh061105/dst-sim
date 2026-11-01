@@ -13,6 +13,7 @@ pub enum Stream {
     Faults,
     Clocks,
     Node(NodeId),
+    Disk(NodeId),
 }
 
 impl Stream {
@@ -22,6 +23,7 @@ impl Stream {
             Stream::Faults => 1,
             Stream::Clocks => 2,
             Stream::Node(node) => (1 << 32) | u64::from(node.0),
+            Stream::Disk(node) => (2 << 32) | u64::from(node.0),
         }
     }
 }

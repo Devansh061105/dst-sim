@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use sim_api::{Context, Node, NodeId, Rand, Time, TimerId};
+use sim_api::{Context, Node, NodeId, Rand, Storage, Time, TimerId};
+use sim_disk::{CrashReport, Disk, DiskConfig, DiskIo};
 use sim_net::{NetConfig, Network, Route};
 
 use crate::clock::{Clock, ClockConfig};
@@ -18,6 +19,7 @@ pub struct SimConfig {
     pub net: NetConfig,
     pub faults: FaultConfig,
     pub clocks: ClockConfig,
+    pub disk: DiskConfig,
     /// Stop once the next event is later than this much virtual time.
     pub max_time: Duration,
     /// Stop after this many events: a guard against protocols that never go quiet.
@@ -28,7 +30,7 @@ pub struct SimConfig {
 
 impl SimConfig {
     /// A fault-free cluster: messages are only delayed (1–10 ms), nodes never crash, clocks are
-    /// perfect.
+    /// perfect, and a crash (if injected) loses exactly the unsynced disk writes.
     pub fn new(seed: u64, nodes: u32) -> Self {
         SimConfig {
             seed,
@@ -36,6 +38,7 @@ impl SimConfig {
             net: NetConfig::default(),
             faults: FaultConfig::none(),
             clocks: ClockConfig::default(),
+            disk: DiskConfig::default(),
             max_time: Duration::from_secs(60),
             max_steps: 1_000_000,
             keep_trace_lines: false,
@@ -44,8 +47,9 @@ impl SimConfig {
 
     /// Everything on: 5% message loss, 2% duplication, 2% delay spikes, a partition or crash every
     /// 0.1–1 s for the first 10 s (at most a minority of nodes down at once), clocks up to 1 s
-    /// ahead and drifting up to ±5%. After 10 s the network heals and every node restarts, so
-    /// tests can check the system recovers.
+    /// ahead and drifting up to ±5%, and disks where 1% of syncs fail and a crash keeps half the
+    /// unsynced writes (10% of those torn). After 10 s the network heals and every node restarts,
+    /// so tests can check the system recovers.
     pub fn chaos(seed: u64, nodes: u32) -> Self {
         SimConfig {
             net: NetConfig { drop: 0.05, duplicate: 0.02, spike: 0.02, ..NetConfig::default() },
@@ -56,6 +60,7 @@ impl SimConfig {
                 ..FaultConfig::none()
             },
             clocks: ClockConfig { max_offset: Duration::from_secs(1), max_drift_ppm: 50_000 },
+            disk: DiskConfig { unsynced_survive: 0.5, torn_write: 0.1, sync_fail: 0.01 },
             ..SimConfig::new(seed, nodes)
         }
     }
@@ -83,6 +88,12 @@ pub struct Stats {
     pub restarts: u64,
     /// Splits and one-way link failures injected.
     pub partitions: u64,
+    pub sync_failures: u64,
+    /// Unsynced disk operations that crashes threw away.
+    pub unsynced_lost: u64,
+    /// Unsynced disk operations that reached the disk before a crash anyway.
+    pub unsynced_survived: u64,
+    pub torn_writes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +133,9 @@ pub struct Simulation<N: Node> {
     /// Bumped on every restart, so a start event from before a crash can't boot the node twice.
     incarnations: Vec<u64>,
     clocks: Vec<Clock>,
+    /// One disk per node. Disks outlive crashes; that is how a restarted node recovers.
+    disks: Vec<Disk>,
+    disk_rngs: Vec<SimRng>,
     node_rngs: Vec<SimRng>,
     net_rng: SimRng,
     fault_rng: SimRng,
@@ -145,6 +159,8 @@ impl<N: Node> Simulation<N> {
         let node_rngs = ids.iter().map(|&id| SimRng::new(config.seed, Stream::Node(id))).collect();
         let mut clock_rng = SimRng::new(config.seed, Stream::Clocks);
         let clocks = ids.iter().map(|_| Clock::random(&config.clocks, &mut clock_rng)).collect();
+        let disks = ids.iter().map(|_| Disk::new(config.disk.clone())).collect();
+        let disk_rngs = ids.iter().map(|&id| SimRng::new(config.seed, Stream::Disk(id))).collect();
         let mut fault_rng = SimRng::new(config.seed, Stream::Faults);
 
         let mut queue = EventQueue::new();
@@ -166,6 +182,8 @@ impl<N: Node> Simulation<N> {
             up: vec![true; ids.len()],
             incarnations: vec![0; ids.len()],
             clocks,
+            disks,
+            disk_rngs,
             node_rngs,
             net_rng: SimRng::new(config.seed, Stream::Network),
             fault_rng,
@@ -274,9 +292,21 @@ impl<N: Node> Simulation<N> {
                 let i = node.0 as usize;
                 assert!(self.up[i], "{node} is already down");
                 self.up[i] = false;
-                // A dead process has no timers.
+                // A dead process has no timers, and its page cache is gone.
                 self.active_timers.retain(|_, owner| owner != node);
                 self.stats.crashes += 1;
+                self.trace.record::<N::Message, N::Timer>(self.now, &Entry::Fault(&fault));
+                let report = self.disks[i].crash(&mut self.disk_rngs[i]);
+                self.stats.unsynced_lost += report.lost;
+                self.stats.unsynced_survived += report.survived;
+                self.stats.torn_writes += report.torn;
+                if report != CrashReport::default() {
+                    self.trace.record::<N::Message, N::Timer>(
+                        self.now,
+                        &Entry::DiskCrash { node: *node, report },
+                    );
+                }
+                return;
             }
             Fault::Restart(node) => {
                 let i = node.0 as usize;
@@ -310,6 +340,11 @@ impl<N: Node> Simulation<N> {
 
     pub fn stats(&self) -> Stats {
         self.stats
+    }
+
+    /// A node's disk, for inspecting what is durable.
+    pub fn disk(&self, id: NodeId) -> &Disk {
+        &self.disks[id.0 as usize]
     }
 
     pub fn trace(&self) -> &Trace {
@@ -349,11 +384,18 @@ impl<N: Node> Simulation<N> {
             nodes: &self.ids,
             now: self.clocks[idx].local(self.now),
             rng: &mut self.node_rngs[idx],
+            storage: DiskIo { disk: &mut self.disks[idx], rand: &mut self.disk_rngs[idx] },
             next_timer_id: &mut self.next_timer_id,
             effects: Vec::new(),
         };
         callback(&mut self.nodes[idx], &mut ctx);
-        for effect in ctx.effects {
+        let effects = ctx.effects;
+        for failure in self.disks[idx].take_sync_failures() {
+            self.stats.sync_failures += 1;
+            let entry = Entry::SyncFailed { node, file: &failure.file, dropped: failure.dropped };
+            self.trace.record::<N::Message, N::Timer>(self.now, &entry);
+        }
+        for effect in effects {
             self.apply(node, effect);
         }
     }
@@ -407,6 +449,7 @@ struct SimContext<'a, M, T> {
     /// The node's local clock reading, not real time.
     now: Time,
     rng: &'a mut SimRng,
+    storage: DiskIo<'a, SimRng>,
     next_timer_id: &'a mut u64,
     effects: Vec<Effect<M, T>>,
 }
@@ -437,6 +480,10 @@ impl<M, T> Context<M, T> for SimContext<'_, M, T> {
 
     fn cancel_timer(&mut self, id: TimerId) {
         self.effects.push(Effect::CancelTimer { id });
+    }
+
+    fn storage(&mut self) -> &mut dyn Storage {
+        &mut self.storage
     }
 
     fn random_u64(&mut self) -> u64 {

@@ -3,6 +3,8 @@ use std::hash::{Hash, Hasher};
 
 use sim_api::{NodeId, Time, TimerId};
 
+use sim_disk::CrashReport;
+
 use crate::faults::Fault;
 
 /// Record of a run: a running hash of every processed event, plus optional readable lines.
@@ -64,6 +66,8 @@ pub(crate) enum Entry<'a, M, T> {
     Timer { node: NodeId, id: TimerId, timer: &'a T },
     Fault(&'a Fault),
     Drop { from: NodeId, to: NodeId, reason: DropReason, msg: &'a M },
+    DiskCrash { node: NodeId, report: CrashReport },
+    SyncFailed { node: NodeId, file: &'a str, dropped: u64 },
 }
 
 impl<M: Hash, T: Hash> Entry<'_, M, T> {
@@ -97,6 +101,19 @@ impl<M: Hash, T: Hash> Entry<'_, M, T> {
                 h.write_u8(*reason as u8);
                 msg.hash(h);
             }
+            Entry::DiskCrash { node, report } => {
+                h.write_u8(5);
+                h.write_u32(node.0);
+                h.write_u64(report.survived);
+                h.write_u64(report.torn);
+                h.write_u64(report.lost);
+            }
+            Entry::SyncFailed { node, file, dropped } => {
+                h.write_u8(6);
+                h.write_u32(node.0);
+                h.write(file.as_bytes());
+                h.write_u64(*dropped);
+            }
         }
     }
 }
@@ -110,6 +127,14 @@ impl<M: fmt::Debug, T: fmt::Debug> fmt::Display for Entry<'_, M, T> {
             Entry::Fault(fault) => write!(f, "nemesis {fault}"),
             Entry::Drop { from, to, reason, msg } => {
                 write!(f, "{to} <-x- {from} {reason:?} {msg:?}")
+            }
+            Entry::DiskCrash { node, report } => write!(
+                f,
+                "{node} disk crash: {} unsynced ops survived ({} torn), {} lost",
+                report.survived, report.torn, report.lost
+            ),
+            Entry::SyncFailed { node, file, dropped } => {
+                write!(f, "{node} disk sync failed on {file}, {dropped} ops dropped")
             }
         }
     }

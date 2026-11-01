@@ -54,10 +54,10 @@ Wk:  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16
 **Done when:** unit tests verify each fault; gossip test passes across 1,000 seeds.
 
 ## Phase 3 — Simulated disk (week 4) → M3
-- [ ] `Storage` trait: write / read / fsync / size (F7)
-- [ ] Volatile vs durable layers; crash discards unsynced data
-- [ ] Faults: torn writes, fsync error, latency spikes
-- [ ] Record format with CRC32 checksums (prepares for F18)
+- [x] `Storage` trait: write / read / fsync / size (F7)
+- [x] Volatile vs durable layers; crash discards unsynced data
+- [x] Faults: torn writes, fsync error (latency spikes dropped: synchronous API)
+- [x] Record format with CRC32 checksums (prepares for F18)
 
 **Done when:** tests show "write, no fsync, crash" loses data and "write, fsync, crash" keeps it; torn writes are detected by the checksum.
 

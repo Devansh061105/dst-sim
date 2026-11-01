@@ -20,5 +20,6 @@ pub use faults::{Fault, FaultConfig};
 pub use queue::EventQueue;
 pub use rng::{SimRng, Stream};
 pub use sim::{RunSummary, SimConfig, Simulation, Stats, StopReason};
+pub use sim_disk::{Disk, DiskConfig};
 pub use sim_net::NetConfig;
 pub use trace::Trace;

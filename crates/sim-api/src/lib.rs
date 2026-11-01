@@ -5,6 +5,8 @@
 //! runs in both.
 
 mod random;
+pub mod record;
+mod storage;
 mod time;
 
 use std::fmt;
@@ -13,6 +15,7 @@ use std::ops::Range;
 use std::time::Duration;
 
 pub use random::Rand;
+pub use storage::{Storage, SyncError};
 pub use time::Time;
 
 /// Identifies a node in the cluster. Nodes are numbered `0..cluster_size`.
@@ -79,6 +82,9 @@ pub trait Context<M, T> {
 
     /// Cancel a pending timer. Cancelling one that already fired is a no-op.
     fn cancel_timer(&mut self, id: TimerId);
+
+    /// This node's disk. It outlives crashes; only synced data is guaranteed to survive one.
+    fn storage(&mut self) -> &mut dyn Storage;
 
     /// A random number from this node's own deterministic stream.
     fn random_u64(&mut self) -> u64;
