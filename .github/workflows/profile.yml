@@ -20,10 +20,14 @@ jobs:
           sudo apt-get install -y linux-tools-common "linux-tools-$(uname -r)"
           sudo sysctl kernel.perf_event_paranoid=-1
           cargo install flamegraph --locked
+      # Frame pointers let perf walk the stack cheaply; DWARF unwinding lost most stacks.
       - name: Flamegraph
+        env:
+          RUSTFLAGS: -C force-frame-pointers=yes
         run: |
-          cargo flamegraph --release -p dst-cli --bin dst -o flamegraph.svg -- \
-            sweep --seeds 0..2000 --mode chaos --jobs 1
+          cargo flamegraph --release -p dst-cli --bin dst -o flamegraph.svg \
+            --cmd "record -F 1999 --call-graph fp -g" -- \
+            sweep --seeds 0..5000 --mode chaos --jobs 1
       # Every frame's share of samples is in the SVG's tooltips.
       - uses: actions/upload-artifact@v4
         with:
