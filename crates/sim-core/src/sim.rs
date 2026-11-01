@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use sim_api::{Context, Node, NodeId, Rand, Storage, Time, TimerId};
+use sim_api::{Context, Node, NodeId, Rand, Storage, SyncError, Time, TimerId};
 use sim_disk::{CrashReport, Disk, DiskConfig, DiskIo};
 use sim_net::{NetConfig, Network, Route};
 
@@ -47,9 +47,10 @@ impl SimConfig {
 
     /// Everything on: 5% message loss, 2% duplication, 2% delay spikes, a partition or crash every
     /// 0.1–1 s for the first 10 s (at most a minority of nodes down at once), clocks up to 1 s
-    /// ahead and drifting up to ±5%, and disks where 1% of syncs fail and a crash keeps half the
-    /// unsynced writes (10% of those torn). After 10 s the network heals and every node restarts,
-    /// so tests can check the system recovers.
+    /// ahead and drifting up to ±5%, and disks where 0.5% of syncs fail, 0.5% of syncs are cut
+    /// short by the process dying, and a crash keeps half the unsynced writes (30% of those torn).
+    /// After 10 s the network heals and every node restarts, so tests can check the system
+    /// recovers.
     pub fn chaos(seed: u64, nodes: u32) -> Self {
         SimConfig {
             net: NetConfig { drop: 0.05, duplicate: 0.02, spike: 0.02, ..NetConfig::default() },
@@ -60,7 +61,12 @@ impl SimConfig {
                 ..FaultConfig::none()
             },
             clocks: ClockConfig { max_offset: Duration::from_secs(1), max_drift_ppm: 50_000 },
-            disk: DiskConfig { unsynced_survive: 0.5, torn_write: 0.1, sync_fail: 0.01 },
+            disk: DiskConfig {
+                unsynced_survive: 0.5,
+                torn_write: 0.3,
+                sync_fail: 0.005,
+                crash_during_sync: 0.005,
+            },
             ..SimConfig::new(seed, nodes)
         }
     }
@@ -85,10 +91,14 @@ pub struct Stats {
     pub to_down_node: u64,
     pub duplicated: u64,
     pub crashes: u64,
+    /// Nodes that stopped themselves with `Context::halt` (e.g. after a failed sync).
+    pub halts: u64,
     pub restarts: u64,
     /// Splits and one-way link failures injected.
     pub partitions: u64,
     pub sync_failures: u64,
+    /// Processes that died in the middle of a sync.
+    pub sync_crashes: u64,
     /// Unsynced disk operations that crashes threw away.
     pub unsynced_lost: u64,
     /// Unsynced disk operations that reached the disk before a crash anyway.
@@ -106,10 +116,25 @@ pub struct RunSummary {
 }
 
 enum Event<M, T> {
-    Start { node: NodeId, incarnation: u64 },
-    Deliver { from: NodeId, to: NodeId, msg: M },
-    Timer { node: NodeId, id: TimerId, timer: T },
+    Start {
+        node: NodeId,
+        incarnation: u64,
+    },
+    Deliver {
+        from: NodeId,
+        to: NodeId,
+        msg: M,
+    },
+    Timer {
+        node: NodeId,
+        id: TimerId,
+        timer: T,
+    },
     Nemesis,
+    /// The supervisor restarting a node that halted itself.
+    Restart {
+        node: NodeId,
+    },
 }
 
 /// What a node asked for during one callback. The simulator decides what actually happens.
@@ -117,6 +142,7 @@ enum Effect<M, T> {
     Send { to: NodeId, msg: M },
     SetTimer { id: TimerId, after: Duration, timer: T },
     CancelTimer { id: TimerId },
+    Halt,
 }
 
 /// A whole cluster running on one thread in virtual time.
@@ -242,6 +268,8 @@ impl<N: Node> Simulation<N> {
                 let i = node.0 as usize;
                 self.up[i] && self.incarnations[i] == *incarnation
             }
+            // The nemesis may already have restarted it.
+            Event::Restart { node } => !self.up[node.0 as usize],
             Event::Deliver { .. } | Event::Nemesis => true,
         };
         if !live {
@@ -269,6 +297,7 @@ impl<N: Node> Simulation<N> {
                 self.dispatch(node, |n, ctx| n.on_timer(ctx, id, timer));
             }
             Event::Nemesis => self.nemesis(),
+            Event::Restart { node } => self.inject(Fault::Restart(node)),
         }
         None
     }
@@ -289,23 +318,9 @@ impl<N: Node> Simulation<N> {
                 self.stats.partitions += 1;
             }
             Fault::Crash(node) => {
-                let i = node.0 as usize;
-                assert!(self.up[i], "{node} is already down");
-                self.up[i] = false;
-                // A dead process has no timers, and its page cache is gone.
-                self.active_timers.retain(|_, owner| owner != node);
                 self.stats.crashes += 1;
                 self.trace.record::<N::Message, N::Timer>(self.now, &Entry::Fault(&fault));
-                let report = self.disks[i].crash(&mut self.disk_rngs[i]);
-                self.stats.unsynced_lost += report.lost;
-                self.stats.unsynced_survived += report.survived;
-                self.stats.torn_writes += report.torn;
-                if report != CrashReport::default() {
-                    self.trace.record::<N::Message, N::Timer>(
-                        self.now,
-                        &Entry::DiskCrash { node: *node, report },
-                    );
-                }
+                self.crash_node(*node);
                 return;
             }
             Fault::Restart(node) => {
@@ -314,9 +329,14 @@ impl<N: Node> Simulation<N> {
                 self.nodes[i] = (self.make_node)(*node);
                 self.up[i] = true;
                 self.incarnations[i] += 1;
-                let incarnation = self.incarnations[i];
-                self.queue.push(self.now, Event::Start { node: *node, incarnation });
                 self.stats.restarts += 1;
+                self.trace.record::<N::Message, N::Timer>(self.now, &Entry::Fault(&fault));
+                // Boot right away rather than queueing a start event: otherwise a message due at
+                // this same instant could reach the new process before its `on_start` (recovery)
+                // had run.
+                self.trace.record::<N::Message, N::Timer>(self.now, &Entry::Start { node: *node });
+                self.dispatch(*node, |n, ctx| n.on_start(ctx));
+                return;
             }
         }
         self.trace.record::<N::Message, N::Timer>(self.now, &Entry::Fault(&fault));
@@ -334,6 +354,11 @@ impl<N: Node> Simulation<N> {
         &self.nodes[id.0 as usize]
     }
 
+    /// Mutable access for test harnesses, e.g. to collect events a node recorded.
+    pub fn node_mut(&mut self, id: NodeId) -> &mut N {
+        &mut self.nodes[id.0 as usize]
+    }
+
     pub fn nodes(&self) -> impl Iterator<Item = (NodeId, &N)> {
         self.ids.iter().copied().zip(&self.nodes)
     }
@@ -349,6 +374,30 @@ impl<N: Node> Simulation<N> {
 
     pub fn trace(&self) -> &Trace {
         &self.trace
+    }
+
+    /// The process dies: its timers are gone and its disk loses the page cache.
+    fn crash_node(&mut self, node: NodeId) {
+        let i = node.0 as usize;
+        assert!(self.up[i], "{node} is already down");
+        self.up[i] = false;
+        self.active_timers.retain(|_, owner| *owner != node);
+        let report = self.disks[i].crash(&mut self.disk_rngs[i]);
+        self.stats.unsynced_lost += report.lost;
+        self.stats.unsynced_survived += report.survived;
+        self.stats.torn_writes += report.torn;
+        if report != CrashReport::default() {
+            self.trace.record::<N::Message, N::Timer>(self.now, &Entry::DiskCrash { node, report });
+        }
+    }
+
+    /// The node stopped itself; a supervisor restarts it after `restart_delay`.
+    fn halt(&mut self, node: NodeId) {
+        self.stats.halts += 1;
+        self.trace.record::<N::Message, N::Timer>(self.now, &Entry::Halt { node });
+        self.crash_node(node);
+        let delay = self.fault_rng.duration_in(self.config.faults.restart_delay.clone());
+        self.queue.push(self.now + delay, Event::Restart { node });
     }
 
     fn nemesis(&mut self) {
@@ -387,8 +436,10 @@ impl<N: Node> Simulation<N> {
             storage: DiskIo { disk: &mut self.disks[idx], rand: &mut self.disk_rngs[idx] },
             next_timer_id: &mut self.next_timer_id,
             effects: Vec::new(),
+            sync_crashes: 0,
         };
         callback(&mut self.nodes[idx], &mut ctx);
+        self.stats.sync_crashes += ctx.sync_crashes;
         let effects = ctx.effects;
         for failure in self.disks[idx].take_sync_failures() {
             self.stats.sync_failures += 1;
@@ -397,6 +448,10 @@ impl<N: Node> Simulation<N> {
         }
         for effect in effects {
             self.apply(node, effect);
+            if !self.up[idx] {
+                // The node halted: nothing it asked for afterwards happens.
+                break;
+            }
         }
     }
 
@@ -429,6 +484,7 @@ impl<N: Node> Simulation<N> {
             Effect::CancelTimer { id } => {
                 self.active_timers.remove(&id);
             }
+            Effect::Halt => self.halt(from),
         }
     }
 
@@ -452,6 +508,37 @@ struct SimContext<'a, M, T> {
     storage: DiskIo<'a, SimRng>,
     next_timer_id: &'a mut u64,
     effects: Vec<Effect<M, T>>,
+    sync_crashes: u64,
+}
+
+// Disk calls go through the context (rather than straight to the `DiskIo`) so that a crash in the
+// middle of a sync can stop the node at exactly that point: everything it asks for afterwards
+// lands behind the halt and is discarded.
+impl<M, T> Storage for SimContext<'_, M, T> {
+    fn read(&self, file: &str) -> Vec<u8> {
+        self.storage.read(file)
+    }
+
+    fn file_len(&self, file: &str) -> u64 {
+        self.storage.file_len(file)
+    }
+
+    fn write(&mut self, file: &str, offset: u64, data: &[u8]) {
+        self.storage.write(file, offset, data);
+    }
+
+    fn truncate(&mut self, file: &str, len: u64) {
+        self.storage.truncate(file, len);
+    }
+
+    fn sync(&mut self, file: &str) -> Result<(), SyncError> {
+        let result = self.storage.sync(file);
+        if self.storage.disk.take_crash_in_sync() {
+            self.sync_crashes += 1;
+            self.effects.push(Effect::Halt);
+        }
+        result
+    }
 }
 
 impl<M, T> Context<M, T> for SimContext<'_, M, T> {
@@ -483,7 +570,11 @@ impl<M, T> Context<M, T> for SimContext<'_, M, T> {
     }
 
     fn storage(&mut self) -> &mut dyn Storage {
-        &mut self.storage
+        self
+    }
+
+    fn halt(&mut self) {
+        self.effects.push(Effect::Halt);
     }
 
     fn random_u64(&mut self) -> u64 {

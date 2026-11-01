@@ -20,6 +20,10 @@ pub struct DiskConfig {
     pub torn_write: f64,
     /// The probability that a sync with pending operations fails.
     pub sync_fail: f64,
+    /// The probability that the process dies in the middle of a sync with pending operations:
+    /// the sync never completes, and the crash decides which of those operations reached the
+    /// disk (possibly torn). The simulator stops the node at that point.
+    pub crash_during_sync: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -56,14 +60,17 @@ pub struct Disk {
     config: DiskConfig,
     files: BTreeMap<String, File>,
     sync_failures: Vec<SyncFailure>,
+    /// The process died mid-sync; set until the simulator takes it and crashes the node.
+    crashed_in_sync: bool,
 }
 
 impl Disk {
     pub fn new(config: DiskConfig) -> Self {
-        for p in [config.unsynced_survive, config.torn_write, config.sync_fail] {
+        let DiskConfig { unsynced_survive, torn_write, sync_fail, crash_during_sync } = config;
+        for p in [unsynced_survive, torn_write, sync_fail, crash_during_sync] {
             assert!((0.0..=1.0).contains(&p), "probability {p} is outside [0, 1]");
         }
-        Disk { config, files: BTreeMap::new(), sync_failures: Vec::new() }
+        Disk { config, files: BTreeMap::new(), sync_failures: Vec::new(), crashed_in_sync: false }
     }
 
     pub fn read(&self, file: &str) -> &[u8] {
@@ -92,9 +99,17 @@ impl Disk {
     /// Makes `file`'s pending operations durable, unless the sync fails. A failed sync drops them:
     /// they stay visible to this process but will never reach the disk, and a retry "succeeds".
     pub fn sync(&mut self, file: &str, rand: &mut impl Rand) -> Result<(), SyncError> {
+        if self.crashed_in_sync {
+            return Err(SyncError); // the process is already dead
+        }
         let Some(f) = self.files.get_mut(file) else { return Ok(()) };
         if f.pending.is_empty() {
             return Ok(());
+        }
+        if rand.chance(self.config.crash_during_sync) {
+            // Leave the operations pending: the crash decides which of them made it.
+            self.crashed_in_sync = true;
+            return Err(SyncError);
         }
         if rand.chance(self.config.sync_fail) {
             let dropped = f.pending.len() as u64;
@@ -135,6 +150,11 @@ impl Disk {
     /// Sync failures since the last call, for the simulator's trace and stats.
     pub fn take_sync_failures(&mut self) -> Vec<SyncFailure> {
         std::mem::take(&mut self.sync_failures)
+    }
+
+    /// Whether the process died in the middle of a sync since the last call.
+    pub fn take_crash_in_sync(&mut self) -> bool {
+        std::mem::take(&mut self.crashed_in_sync)
     }
 }
 

@@ -88,7 +88,7 @@ fn crash_stops_node_and_restart_recovers() {
     sim.run_until(at(4));
     {
         let lines = sim.trace().lines().unwrap();
-        let crash = lines.iter().position(|l| l.ends_with("nemesis crash n0")).unwrap();
+        let crash = lines.iter().position(|l| l.ends_with("fault crash n0")).unwrap();
         let after = &lines[crash + 1..];
         assert!(!after.iter().any(|l| l.contains("] n0 timer") || l.contains("] n0 <- ")));
         assert!(after.iter().any(|l| l.contains("n0 <-x- n1 NodeDown")));

@@ -62,11 +62,11 @@ Wk:  0   1   2   3   4   5   6   7   8   9  10  11  12  13  14  15  16
 **Done when:** tests show "write, no fsync, crash" loses data and "write, fsync, crash" keeps it; torn writes are detected by the checksum.
 
 ## Phase 4 — Raft KV store (weeks 5–7) → M4
-- [ ] Week 5: leader election (randomised timeouts, `RequestVote`, terms); persistent term and vote
-- [ ] Week 6: log replication (`AppendEntries`, conflict truncation, commit index, apply)
-- [ ] Week 7: KV state machine (`get`/`put`/`cas`), clients with retries and request IDs (F8)
-- [ ] Safety invariants checked every step (F9)
-- [ ] Crash recovery from the simulated disk
+- [x] Week 5: leader election (randomised timeouts, `RequestVote`, terms); persistent term and vote
+- [x] Week 6: log replication (`AppendEntries`, conflict truncation, commit index, apply)
+- [x] Week 7: KV state machine (`get`/`put`/`cas`), clients with retries and request IDs (F8)
+- [x] Safety invariants checked every step (F9)
+- [x] Crash recovery from the simulated disk
 
 **Done when:** 10,000 seeds with all Phase 2–3 faults enabled show no invariant violations.
 

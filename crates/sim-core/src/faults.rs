@@ -19,6 +19,8 @@ pub struct FaultConfig {
     pub crashes: bool,
     /// Most nodes down at the same time.
     pub max_down: u32,
+    /// How long the supervisor waits before restarting a node that halted itself.
+    pub restart_delay: Range<Duration>,
 }
 
 impl FaultConfig {
@@ -30,6 +32,7 @@ impl FaultConfig {
             partitions: false,
             crashes: false,
             max_down: 0,
+            restart_delay: Duration::from_millis(100)..Duration::from_millis(500),
         }
     }
 

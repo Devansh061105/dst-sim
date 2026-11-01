@@ -7,6 +7,7 @@
 mod random;
 pub mod record;
 mod storage;
+mod sub_context;
 mod time;
 
 use std::fmt;
@@ -16,6 +17,7 @@ use std::time::Duration;
 
 pub use random::Rand;
 pub use storage::{Storage, SyncError};
+pub use sub_context::SubContext;
 pub use time::Time;
 
 /// Identifies a node in the cluster. Nodes are numbered `0..cluster_size`.
@@ -85,6 +87,11 @@ pub trait Context<M, T> {
 
     /// This node's disk. It outlives crashes; only synced data is guaranteed to survive one.
     fn storage(&mut self) -> &mut dyn Storage;
+
+    /// Stops this process at once, as if it had crashed, and has it restarted shortly after (like
+    /// a supervisor restarting a process that panicked). Anything requested after this call in
+    /// the same callback is discarded. This is the safe reaction to a failed sync.
+    fn halt(&mut self);
 
     /// A random number from this node's own deterministic stream.
     fn random_u64(&mut self) -> u64;

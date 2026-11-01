@@ -68,6 +68,7 @@ pub(crate) enum Entry<'a, M, T> {
     Drop { from: NodeId, to: NodeId, reason: DropReason, msg: &'a M },
     DiskCrash { node: NodeId, report: CrashReport },
     SyncFailed { node: NodeId, file: &'a str, dropped: u64 },
+    Halt { node: NodeId },
 }
 
 impl<M: Hash, T: Hash> Entry<'_, M, T> {
@@ -114,6 +115,10 @@ impl<M: Hash, T: Hash> Entry<'_, M, T> {
                 h.write(file.as_bytes());
                 h.write_u64(*dropped);
             }
+            Entry::Halt { node } => {
+                h.write_u8(7);
+                h.write_u32(node.0);
+            }
         }
     }
 }
@@ -124,7 +129,7 @@ impl<M: fmt::Debug, T: fmt::Debug> fmt::Display for Entry<'_, M, T> {
             Entry::Start { node } => write!(f, "{node} start"),
             Entry::Deliver { from, to, msg } => write!(f, "{to} <- {from} {msg:?}"),
             Entry::Timer { node, timer, .. } => write!(f, "{node} timer {timer:?}"),
-            Entry::Fault(fault) => write!(f, "nemesis {fault}"),
+            Entry::Fault(fault) => write!(f, "fault {fault}"),
             Entry::Drop { from, to, reason, msg } => {
                 write!(f, "{to} <-x- {from} {reason:?} {msg:?}")
             }
@@ -136,6 +141,7 @@ impl<M: fmt::Debug, T: fmt::Debug> fmt::Display for Entry<'_, M, T> {
             Entry::SyncFailed { node, file, dropped } => {
                 write!(f, "{node} disk sync failed on {file}, {dropped} ops dropped")
             }
+            Entry::Halt { node } => write!(f, "{node} halted; restart scheduled"),
         }
     }
 }

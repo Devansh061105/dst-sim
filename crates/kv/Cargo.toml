@@ -11,3 +11,6 @@ raft = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+sim-core = { workspace = true }

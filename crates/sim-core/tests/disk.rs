@@ -12,7 +12,7 @@ const N0: NodeId = NodeId(0);
 const RECORD_LEN: u64 = 16;
 
 fn harsh_disk() -> DiskConfig {
-    DiskConfig { unsynced_survive: 0.5, torn_write: 0.3, sync_fail: 0.02 }
+    DiskConfig { unsynced_survive: 0.5, torn_write: 0.3, sync_fail: 0.02, ..DiskConfig::default() }
 }
 
 struct Outcome {
