@@ -1,0 +1,43 @@
+name: Seed sweep
+
+on:
+  push:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release -p dst-cli
+
+      - name: Chaos sweep
+        if: github.event_name != 'schedule'
+        run: ./target/release/dst sweep --seeds 0..10000 --mode chaos --failures failures-chaos.txt
+      - name: Swarm sweep
+        if: github.event_name != 'schedule'
+        run: ./target/release/dst sweep --seeds 0..2000 --mode swarm --failures failures-swarm.txt
+
+      # Each night explores seeds it has never run before.
+      - name: Nightly swarm sweep
+        if: github.event_name == 'schedule'
+        run: |
+          start=$(( GITHUB_RUN_NUMBER * 200000 ))
+          ./target/release/dst sweep --seeds "$start..$(( start + 200000 ))" --mode swarm \
+            --failures failures-nightly.txt
+
+      - name: Upload failing seeds
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failing-seeds
+          path: failures-*.txt
+          if-no-files-found: ignore

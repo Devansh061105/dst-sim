@@ -16,9 +16,13 @@ sim-disk = { path = "crates/sim-disk" }
 checker = { path = "crates/checker" }
 raft = { path = "crates/raft" }
 kv = { path = "crates/kv" }
+harness = { path = "crates/harness" }
 
 # External crates (keep this list short: disk space is limited).
 rand_chacha = { version = "0.10", default-features = false }
+# No "color" feature: it pulls in windows-sys, which needs dlltool on the GNU toolchain.
+clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions"] }
+rayon = "1.12"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

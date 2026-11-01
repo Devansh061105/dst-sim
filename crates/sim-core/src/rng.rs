@@ -14,6 +14,9 @@ pub enum Stream {
     Clocks,
     Node(NodeId),
     Disk(NodeId),
+    /// Picks a seed's fault mix in [`SimConfig::swarm`](crate::SimConfig::swarm).
+    Swarm,
+    Buggify(NodeId),
 }
 
 impl Stream {
@@ -22,8 +25,10 @@ impl Stream {
             Stream::Network => 0,
             Stream::Faults => 1,
             Stream::Clocks => 2,
+            Stream::Swarm => 3,
             Stream::Node(node) => (1 << 32) | u64::from(node.0),
             Stream::Disk(node) => (2 << 32) | u64::from(node.0),
+            Stream::Buggify(node) => (3 << 32) | u64::from(node.0),
         }
     }
 }

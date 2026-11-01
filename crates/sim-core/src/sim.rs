@@ -20,6 +20,8 @@ pub struct SimConfig {
     pub faults: FaultConfig,
     pub clocks: ClockConfig,
     pub disk: DiskConfig,
+    /// Probability that a BUGGIFY point (`Context::buggify`) fires. 0 turns BUGGIFY off.
+    pub buggify: f64,
     /// Stop once the next event is later than this much virtual time.
     pub max_time: Duration,
     /// Stop after this many events: a guard against protocols that never go quiet.
@@ -39,6 +41,7 @@ impl SimConfig {
             faults: FaultConfig::none(),
             clocks: ClockConfig::default(),
             disk: DiskConfig::default(),
+            buggify: 0.0,
             max_time: Duration::from_secs(60),
             max_steps: 1_000_000,
             keep_trace_lines: false,
@@ -67,6 +70,48 @@ impl SimConfig {
                 sync_fail: 0.005,
                 crash_during_sync: 0.005,
             },
+            ..SimConfig::new(seed, nodes)
+        }
+    }
+
+    /// Swarm testing: every seed also picks *which* faults are on and how hard they hit, from its
+    /// own random stream. A single fixed mix tends to hide bugs that need one fault to be absent
+    /// so another can reach a rare state (Groce et al., "Swarm Testing", ISSTA 2012). Every mix
+    /// still ends with the calm period, so a correct system always finishes.
+    pub fn swarm(seed: u64, nodes: u32) -> Self {
+        let mut r = SimRng::new(seed, Stream::Swarm);
+        let mut pick = |options: &[f64]| options[r.below(options.len() as u64) as usize];
+        let net = NetConfig {
+            drop: pick(&[0.0, 0.01, 0.05, 0.1]),
+            duplicate: pick(&[0.0, 0.02, 0.1]),
+            spike: pick(&[0.0, 0.02, 0.1]),
+            ..NetConfig::default()
+        };
+        let disk = DiskConfig {
+            unsynced_survive: pick(&[0.0, 0.5, 1.0]),
+            torn_write: pick(&[0.0, 0.3, 1.0]),
+            sync_fail: pick(&[0.0, 0.005, 0.02]),
+            crash_during_sync: pick(&[0.0, 0.005, 0.02]),
+        };
+        let buggify = pick(&[0.0, 0.05]);
+        let max_drift_ppm = pick(&[0.0, 10_000.0, 50_000.0]) as u32;
+        let max_offset = Duration::from_millis(pick(&[0.0, 1_000.0]) as u64);
+        let ms = Duration::from_millis;
+        let paces = [ms(50)..ms(200), ms(100)..ms(1_000), ms(1_000)..ms(3_000)];
+        let interval = paces[r.below(paces.len() as u64) as usize].clone();
+        let faults = FaultConfig {
+            partitions: r.chance(0.5),
+            crashes: r.chance(0.5),
+            max_down: nodes.saturating_sub(1) / 2,
+            interval,
+            ..FaultConfig::none()
+        };
+        SimConfig {
+            net,
+            faults,
+            clocks: ClockConfig { max_offset, max_drift_ppm },
+            disk,
+            buggify,
             ..SimConfig::new(seed, nodes)
         }
     }
@@ -104,6 +149,42 @@ pub struct Stats {
     /// Unsynced disk operations that reached the disk before a crash anyway.
     pub unsynced_survived: u64,
     pub torn_writes: u64,
+}
+
+/// Adds up the counts of several runs.
+impl std::ops::AddAssign for Stats {
+    fn add_assign(&mut self, other: Stats) {
+        let Stats {
+            delivered,
+            lost,
+            partitioned,
+            to_down_node,
+            duplicated,
+            crashes,
+            halts,
+            restarts,
+            partitions,
+            sync_failures,
+            sync_crashes,
+            unsynced_lost,
+            unsynced_survived,
+            torn_writes,
+        } = other;
+        self.delivered += delivered;
+        self.lost += lost;
+        self.partitioned += partitioned;
+        self.to_down_node += to_down_node;
+        self.duplicated += duplicated;
+        self.crashes += crashes;
+        self.halts += halts;
+        self.restarts += restarts;
+        self.partitions += partitions;
+        self.sync_failures += sync_failures;
+        self.sync_crashes += sync_crashes;
+        self.unsynced_lost += unsynced_lost;
+        self.unsynced_survived += unsynced_survived;
+        self.torn_writes += torn_writes;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,6 +244,8 @@ pub struct Simulation<N: Node> {
     disks: Vec<Disk>,
     disk_rngs: Vec<SimRng>,
     node_rngs: Vec<SimRng>,
+    /// Kept apart from `node_rngs` so turning BUGGIFY on doesn't shift a node's own randomness.
+    buggify_rngs: Vec<SimRng>,
     net_rng: SimRng,
     fault_rng: SimRng,
     network: Network,
@@ -183,6 +266,8 @@ impl<N: Node> Simulation<N> {
         let ids: Vec<NodeId> = (0..config.nodes).map(NodeId).collect();
         let nodes = ids.iter().map(|&id| make_node(id)).collect();
         let node_rngs = ids.iter().map(|&id| SimRng::new(config.seed, Stream::Node(id))).collect();
+        let buggify_rngs =
+            ids.iter().map(|&id| SimRng::new(config.seed, Stream::Buggify(id))).collect();
         let mut clock_rng = SimRng::new(config.seed, Stream::Clocks);
         let clocks = ids.iter().map(|_| Clock::random(&config.clocks, &mut clock_rng)).collect();
         let disks = ids.iter().map(|_| Disk::new(config.disk.clone())).collect();
@@ -211,6 +296,7 @@ impl<N: Node> Simulation<N> {
             disks,
             disk_rngs,
             node_rngs,
+            buggify_rngs,
             net_rng: SimRng::new(config.seed, Stream::Network),
             fault_rng,
             network: Network::new(config.net.clone()),
@@ -433,6 +519,8 @@ impl<N: Node> Simulation<N> {
             nodes: &self.ids,
             now: self.clocks[idx].local(self.now),
             rng: &mut self.node_rngs[idx],
+            buggify: self.config.buggify,
+            buggify_rng: &mut self.buggify_rngs[idx],
             storage: DiskIo { disk: &mut self.disks[idx], rand: &mut self.disk_rngs[idx] },
             next_timer_id: &mut self.next_timer_id,
             effects: Vec::new(),
@@ -505,6 +593,8 @@ struct SimContext<'a, M, T> {
     /// The node's local clock reading, not real time.
     now: Time,
     rng: &'a mut SimRng,
+    buggify: f64,
+    buggify_rng: &'a mut SimRng,
     storage: DiskIo<'a, SimRng>,
     next_timer_id: &'a mut u64,
     effects: Vec<Effect<M, T>>,
@@ -579,5 +669,10 @@ impl<M, T> Context<M, T> for SimContext<'_, M, T> {
 
     fn random_u64(&mut self) -> u64 {
         self.rng.next_u64()
+    }
+
+    fn buggify(&mut self) -> bool {
+        // `chance(0.0)` draws nothing, so runs without BUGGIFY are unaffected.
+        self.buggify_rng.chance(self.buggify)
     }
 }

@@ -60,4 +60,8 @@ impl<M, T, SM, ST> Context<SM, ST> for SubContext<'_, M, T, SM, ST> {
     fn random_u64(&mut self) -> u64 {
         self.inner.random_u64()
     }
+
+    fn buggify(&mut self) -> bool {
+        self.inner.buggify()
+    }
 }

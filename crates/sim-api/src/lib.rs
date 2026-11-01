@@ -96,6 +96,13 @@ pub trait Context<M, T> {
     /// A random number from this node's own deterministic stream.
     fn random_u64(&mut self) -> u64;
 
+    /// BUGGIFY (from FoundationDB): `true` occasionally in simulation runs that enable it, and
+    /// always `false` otherwise. Code uses it to take rare-but-correct paths (tiny batches,
+    /// skipped heartbeats, aggressive timeouts) that normal timing seldom reaches.
+    fn buggify(&mut self) -> bool {
+        false
+    }
+
     /// A random number in `range`. Modulo bias is negligible for the small ranges nodes use.
     fn random_range(&mut self, range: Range<u64>) -> u64 {
         assert!(!range.is_empty(), "random_range called with an empty range");

@@ -1,0 +1,16 @@
+[package]
+name = "harness"
+description = "Runs a Raft KV cluster under simulation with every check: Raft invariants each step, liveness, linearizability."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sim-api = { workspace = true }
+sim-core = { workspace = true }
+raft = { workspace = true }
+kv = { workspace = true }
+checker = { workspace = true }
+
+[lints]
+workspace = true

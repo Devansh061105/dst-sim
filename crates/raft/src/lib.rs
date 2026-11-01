@@ -90,6 +90,7 @@ pub struct RaftConfig {
     pub heartbeat: Duration,
     /// Most entries per AppendEntries message.
     pub max_batch: usize,
+    pub bugs: Bugs,
 }
 
 impl RaftConfig {
@@ -99,8 +100,32 @@ impl RaftConfig {
             election_timeout: Duration::from_millis(150)..Duration::from_millis(300),
             heartbeat: Duration::from_millis(50),
             max_batch: 64,
+            bugs: Bugs::default(),
         }
     }
+}
+
+/// Deliberately planted bugs, each a real mistake found in Raft implementations. They exist to
+/// prove the tests catch them; all are off by default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bugs {
+    /// Grant votes without checking that the candidate's log is at least as up to date.
+    pub vote_without_log_check: bool,
+    /// Record a vote in memory without persisting it, so a restart can vote again in the term.
+    pub forget_vote: bool,
+    /// Truncate at the incoming entries even when they match, so a stale, reordered
+    /// AppendEntries erases newer entries.
+    pub truncate_without_conflict: bool,
+    /// Follower commits up to the leader's commit index bounded by its own log end, instead of by
+    /// the last entry this message verified.
+    pub commit_beyond_match: bool,
+    /// Acknowledge appended entries without syncing them.
+    pub skip_append_fsync: bool,
+    /// Leader commits entries from earlier terms by counting replicas (Figure 8 of the paper).
+    pub commit_old_terms: bool,
+    /// Truncate and append under a single sync, so a crash can keep the appends but not the
+    /// truncate.
+    pub single_sync_truncate: bool,
 }
 
 /// Returned by [`Raft::propose`] on a node that is not the leader, with its best guess at who is.
@@ -177,12 +202,15 @@ impl Raft {
             return Err(NotLeader { leader: self.leader });
         }
         let entry = Entry { term: self.durable.term, data };
-        if self.durable.append(ctx.storage(), &[entry]).is_err() {
+        if self.durable.append(ctx.storage(), &[entry], self.sync_appends()).is_err() {
             ctx.halt();
             return Err(NotLeader { leader: None });
         }
         self.advance_commit();
-        self.broadcast_append(ctx);
+        // BUGGIFY: leave it to the next heartbeat instead of replicating right away.
+        if !ctx.buggify() {
+            self.broadcast_append(ctx);
+        }
         Ok(self.last_index())
     }
 
@@ -234,14 +262,16 @@ impl Raft {
             RaftMsg::RequestVote { term, last_log_index, last_log_term } => {
                 // The election restriction: only vote for a candidate whose log is at least as
                 // up to date, so whoever wins already holds every committed entry.
-                let up_to_date =
-                    (last_log_term, last_log_index) >= (self.last_term(), self.last_index());
+                let up_to_date = self.config.bugs.vote_without_log_check
+                    || (last_log_term, last_log_index) >= (self.last_term(), self.last_index());
                 let free = self.durable.voted_for.is_none_or(|v| v == from);
                 let granted = term == self.durable.term && free && up_to_date;
                 if granted {
                     if self.durable.voted_for != Some(from) {
                         self.durable.voted_for = Some(from);
-                        self.durable.save_meta(ctx.storage())?;
+                        if !self.config.bugs.forget_vote {
+                            self.durable.save_meta(ctx.storage())?;
+                        }
                     }
                     self.reset_election_timer(ctx);
                 }
@@ -288,7 +318,9 @@ impl Raft {
                         self.send_append(ctx, from);
                     }
                 } else {
-                    *next = (*next).min(index).max(matched + 1);
+                    // BUGGIFY: ignore the hint and back off one entry at a time.
+                    let hint = if ctx.buggify() { next.saturating_sub(1) } else { index };
+                    *next = (*next).min(hint).max(matched + 1);
                     self.send_append(ctx, from);
                 }
             }
@@ -341,6 +373,14 @@ impl Raft {
             return Ok(());
         }
 
+        let sync_truncate = !self.config.bugs.single_sync_truncate;
+        if self.config.bugs.truncate_without_conflict
+            && !entries.is_empty()
+            && prev_log_index < self.last_index()
+        {
+            self.durable.truncate_from(ctx.storage(), prev_log_index + 1, sync_truncate)?;
+        }
+
         // Skip entries we already have. Truncate only on a real conflict (same index, different
         // term): a stale, reordered AppendEntries must never erase newer entries.
         let count = entries.len() as u64;
@@ -352,18 +392,19 @@ impl Raft {
                 break;
             }
             if self.term_at(index) != entry.term {
-                self.durable.truncate_from(ctx.storage(), index)?;
+                self.durable.truncate_from(ctx.storage(), index, sync_truncate)?;
                 first_new = offset;
                 break;
             }
         }
         if first_new < entries.len() {
-            self.durable.append(ctx.storage(), &entries[first_new..])?;
+            self.durable.append(ctx.storage(), &entries[first_new..], self.sync_appends())?;
         }
 
         // Commit up to what the leader has committed, but never past the entries we just checked.
         let last_new = prev_log_index + count;
-        self.commit_index = self.commit_index.max(leader_commit.min(last_new));
+        let bound = if self.config.bugs.commit_beyond_match { self.last_index() } else { last_new };
+        self.commit_index = self.commit_index.max(leader_commit.min(bound));
         reply(ctx, self.durable.term, true, last_new);
         Ok(())
     }
@@ -382,7 +423,10 @@ impl Raft {
             RaftTimer::Heartbeat if self.heartbeat_timer == Some(id) => {
                 self.heartbeat_timer = None;
                 if self.role == Role::Leader {
-                    self.broadcast_append(ctx);
+                    // BUGGIFY: skip a round, so followers may time out and start an election.
+                    if !ctx.buggify() {
+                        self.broadcast_append(ctx);
+                    }
                     self.heartbeat_timer =
                         Some(ctx.set_timer(self.config.heartbeat, RaftTimer::Heartbeat));
                 }
@@ -427,8 +471,8 @@ impl Raft {
             self.match_index.insert(peer, 0);
         }
         // A no-op from this term: committing it also commits every earlier entry (Raft §5.4.2).
-        self.durable
-            .append(ctx.storage(), &[Entry { term: self.durable.term, data: Vec::new() }])?;
+        let noop = Entry { term: self.durable.term, data: Vec::new() };
+        self.durable.append(ctx.storage(), &[noop], self.sync_appends())?;
         self.advance_commit();
         self.broadcast_append(ctx);
         if let Some(t) = self.heartbeat_timer.take() {
@@ -463,7 +507,9 @@ impl Raft {
 
     fn send_append(&self, ctx: &mut RaftContext<'_>, peer: NodeId) {
         let prev = self.next_index[&peer] - 1;
-        let end = (prev as usize + self.config.max_batch).min(self.durable.log.len());
+        // BUGGIFY: one entry at a time, the slowest way to catch a follower up.
+        let batch = if ctx.buggify() { 1 } else { self.config.max_batch };
+        let end = (prev as usize + batch).min(self.durable.log.len());
         ctx.send(
             peer,
             RaftMsg::AppendEntries {
@@ -487,7 +533,8 @@ impl Raft {
         matched.push(self.last_index());
         matched.sort_unstable_by(|a, b| b.cmp(a));
         let candidate = matched[self.majority() - 1];
-        if candidate > self.commit_index && self.term_at(candidate) == self.durable.term {
+        let current_term = self.term_at(candidate) == self.durable.term;
+        if candidate > self.commit_index && (current_term || self.config.bugs.commit_old_terms) {
             self.commit_index = candidate;
         }
     }
@@ -498,7 +545,14 @@ impl Raft {
         }
         let range = &self.config.election_timeout;
         let nanos = ctx.random_range(range.start.as_nanos() as u64..range.end.as_nanos() as u64);
-        self.election_timer = Some(ctx.set_timer(Duration::from_nanos(nanos), RaftTimer::Election));
+        // BUGGIFY: the shortest timeout, so candidates collide and split votes more often.
+        let timeout = if ctx.buggify() { range.start } else { Duration::from_nanos(nanos) };
+        self.election_timer = Some(ctx.set_timer(timeout, RaftTimer::Election));
+    }
+
+    /// Whether log appends are synced before being acknowledged (always, unless a planted bug).
+    fn sync_appends(&self) -> bool {
+        !self.config.bugs.skip_append_fsync
     }
 
     fn peers(&self) -> Vec<NodeId> {

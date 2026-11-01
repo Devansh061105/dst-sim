@@ -10,6 +10,8 @@ use crate::{KvContext, KvMsg, KvTimer, Reply};
 const RETRY: Duration = Duration::from_millis(200);
 /// How long to wait before following a `NotLeader` hint.
 const REDIRECT: Duration = Duration::from_millis(10);
+/// BUGGIFY: an impatient retry, which floods servers with duplicates.
+const IMPATIENT_RETRY: Duration = Duration::from_millis(20);
 
 /// What a client did, in order. Phase 5's linearizability checker consumes this history.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,7 +128,8 @@ impl Client {
     fn send(&mut self, ctx: &mut KvContext<'_>) {
         let op = self.current.clone().expect("an operation is in flight");
         ctx.send(self.servers[self.target], KvMsg::Request { id: self.request_id(), op });
-        self.arm_retry(ctx, RETRY);
+        let retry = if ctx.buggify() { IMPATIENT_RETRY } else { RETRY };
+        self.arm_retry(ctx, retry);
     }
 
     fn arm_retry(&mut self, ctx: &mut KvContext<'_>, after: Duration) {

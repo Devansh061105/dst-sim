@@ -23,6 +23,8 @@ use sim_api::{Context, Node, NodeId, TimerId};
 pub struct Bugs {
     /// Any server answers reads from its own copy instead of going through the Raft log.
     pub local_reads: bool,
+    /// Bugs planted in the Raft layer underneath.
+    pub raft: raft::Bugs,
 }
 
 #[derive(Clone, Debug, Hash)]
@@ -48,6 +50,9 @@ pub enum KvTimer {
 pub type KvContext<'a> = dyn Context<KvMsg, KvTimer> + 'a;
 
 /// One node of a cluster. The simulator runs a single node type, so servers and clients share it.
+// A cluster has a handful of nodes, so the space a client wastes on the larger server variant is
+// negligible, and boxing would add an indirection to every event.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum KvNode {
     Server(Server),

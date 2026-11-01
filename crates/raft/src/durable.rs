@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use sim_api::{NodeId, Storage, SyncError, record};
 
 use crate::Entry;
@@ -18,6 +20,9 @@ pub(crate) struct Durable {
     pub log: Vec<Entry>,
     /// Byte offset in the log file where each entry's record ends, for truncation.
     ends: Vec<u64>,
+    /// The lowest log index (1-based) changed since the invariant checker last looked, so it only
+    /// re-examines what changed. A `Cell` lets the checker reset it through a shared reference.
+    pub changed_from: Cell<Option<u64>>,
 }
 
 impl Durable {
@@ -35,7 +40,13 @@ impl Durable {
             let term = u64::from_le_bytes(payload[..8].try_into().expect("8-byte entry term"));
             durable.log.push(Entry { term, data: payload[8..].to_vec() });
         }
+        durable.mark_changed(1);
         Ok(durable)
+    }
+
+    fn mark_changed(&self, index: u64) {
+        let lowest = self.changed_from.get().map_or(index, |c| c.min(index));
+        self.changed_from.set(Some(lowest));
     }
 
     /// Persists the current term and vote.
@@ -46,12 +57,15 @@ impl Durable {
         storage.sync(META_FILE)
     }
 
-    /// Appends entries to the log and syncs them.
+    /// Appends entries to the log and syncs them (unless `sync` is off, which only a planted bug
+    /// does).
     pub fn append(
         &mut self,
         storage: &mut dyn Storage,
         entries: &[Entry],
+        sync: bool,
     ) -> Result<(), SyncError> {
+        self.mark_changed(self.log.len() as u64 + 1);
         let mut end = self.ends.last().copied().unwrap_or(0);
         for entry in entries {
             let mut payload = entry.term.to_le_bytes().to_vec();
@@ -62,22 +76,25 @@ impl Durable {
             self.ends.push(end);
             self.log.push(entry.clone());
         }
-        storage.sync(LOG_FILE)
+        if sync { storage.sync(LOG_FILE) } else { Ok(()) }
     }
 
     /// Removes the entries from `index` (1-based) on, and syncs that on its own. If the truncate
     /// shared a sync with the appends that follow it, a crash could persist the appends but not
     /// the truncate, splicing new entries in front of stale ones and breaking Log Matching.
+    /// (`sync` off, leaving the truncate to share the next sync, is exactly that planted bug.)
     pub fn truncate_from(
         &mut self,
         storage: &mut dyn Storage,
         index: u64,
+        sync: bool,
     ) -> Result<(), SyncError> {
+        self.mark_changed(index);
         let keep = (index - 1) as usize;
         self.log.truncate(keep);
         self.ends.truncate(keep);
         storage.truncate(LOG_FILE, self.ends.last().copied().unwrap_or(0));
-        storage.sync(LOG_FILE)
+        if sync { storage.sync(LOG_FILE) } else { Ok(()) }
     }
 }
 

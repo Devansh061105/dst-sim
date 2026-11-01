@@ -32,7 +32,7 @@ impl Server {
     /// A server with deliberately planted bugs, for checking that the tests catch them.
     pub fn with_bugs(id: NodeId, members: Vec<NodeId>, bugs: Bugs) -> Self {
         Server {
-            raft: Raft::new(id, RaftConfig::new(members)),
+            raft: Raft::new(id, RaftConfig { bugs: bugs.raft, ..RaftConfig::new(members) }),
             store: BTreeMap::new(),
             sessions: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -78,9 +78,12 @@ impl Server {
             ctx.send(from, KvMsg::Response { id, reply: Reply::Done(OpResult::Value(value)) });
             return;
         }
+        // BUGGIFY: skip the cache and propose the retry again, so deduplication at apply time
+        // has to do the work.
+        let use_cache = !ctx.buggify();
         match self.sessions.get(&id.session) {
             // Already applied: answer from the cache.
-            Some((seq, result)) if *seq == id.seq => {
+            Some((seq, result)) if *seq == id.seq && use_cache => {
                 ctx.send(from, KvMsg::Response { id, reply: Reply::Done(result.clone()) });
                 return;
             }
