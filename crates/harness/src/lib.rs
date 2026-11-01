@@ -5,14 +5,20 @@
 //! client has finished (liveness), and the history is then checked for linearizability. Tests and
 //! the `dst` command-line tool both run clusters through here.
 
+mod scenario;
+mod shrink;
+
+use std::collections::BTreeMap;
 use std::fmt;
 use std::str::FromStr;
 
 use checker::Verdict;
-use kv::{Bugs, KvModel, Recorder, Server};
+use kv::{Bugs, ClientEvent, KvModel, Op, OpResult, Recorder, Server};
 use raft::{Checker, Violation};
-use sim_api::Time;
-use sim_core::{SimConfig, Simulation, Stats};
+pub use scenario::{Knob, Scenario};
+pub use shrink::{Shrunk, shrink};
+use sim_api::{NodeId, Time};
+use sim_core::{Script, SimConfig, Simulation, Stats, TraceEvent};
 
 /// Raft servers in the standard cluster.
 pub const SERVERS: u32 = 5;
@@ -37,11 +43,19 @@ pub enum Mode {
 
 impl Mode {
     pub fn config(self, seed: u64) -> SimConfig {
-        match self {
-            Mode::Calm => SimConfig::new(seed, NODES),
-            Mode::Chaos => SimConfig::chaos(seed, NODES),
-            Mode::Swarm => SimConfig::swarm(seed, NODES),
-        }
+        self.config_for(seed, NODES)
+    }
+
+    pub fn config_for(self, seed: u64, nodes: u32) -> SimConfig {
+        let mut config = match self {
+            Mode::Calm => SimConfig::new(seed, nodes),
+            Mode::Chaos => SimConfig::chaos(seed, nodes),
+            Mode::Swarm => SimConfig::swarm(seed, nodes),
+        };
+        // Only servers keep data, and Raft can rebuild a damaged log only from a majority of
+        // intact servers: corrupt at most a minority of them.
+        config.faults.max_corrupted = config.faults.max_corrupted.min((SERVERS - 1) / 2);
+        config
     }
 
     pub fn name(self) -> &'static str {
@@ -81,10 +95,13 @@ pub enum Bug {
     SkipAppendFsync,
     CommitOldTerms,
     SingleSyncTruncate,
+    TrustDamagedLog,
+    ReadWithoutQuorum,
+    SnapshotWithoutSessions,
 }
 
 impl Bug {
-    pub const ALL: [Bug; 8] = [
+    pub const ALL: [Bug; 11] = [
         Bug::LocalReads,
         Bug::VoteWithoutLogCheck,
         Bug::ForgetVote,
@@ -93,6 +110,9 @@ impl Bug {
         Bug::SkipAppendFsync,
         Bug::CommitOldTerms,
         Bug::SingleSyncTruncate,
+        Bug::TrustDamagedLog,
+        Bug::ReadWithoutQuorum,
+        Bug::SnapshotWithoutSessions,
     ];
 
     pub fn name(self) -> &'static str {
@@ -105,6 +125,9 @@ impl Bug {
             Bug::SkipAppendFsync => "skip-append-fsync",
             Bug::CommitOldTerms => "commit-old-terms",
             Bug::SingleSyncTruncate => "single-sync-truncate",
+            Bug::TrustDamagedLog => "trust-damaged-log",
+            Bug::ReadWithoutQuorum => "read-without-quorum",
+            Bug::SnapshotWithoutSessions => "snapshot-without-sessions",
         }
     }
 
@@ -118,6 +141,11 @@ impl Bug {
             Bug::SkipAppendFsync => "appended entries acknowledged without fsync",
             Bug::CommitOldTerms => "leaders commit earlier-term entries by counting (Figure 8)",
             Bug::SingleSyncTruncate => "truncate and append share one fsync",
+            Bug::TrustDamagedLog => {
+                "a corrupted log is cut short and trusted, so the node keeps voting"
+            }
+            Bug::ReadWithoutQuorum => "the leader serves reads without confirming it still leads",
+            Bug::SnapshotWithoutSessions => "snapshots leave out the client session table",
         }
     }
 
@@ -134,6 +162,9 @@ impl Bug {
             Bug::SkipAppendFsync => raft.skip_append_fsync = true,
             Bug::CommitOldTerms => raft.commit_old_terms = true,
             Bug::SingleSyncTruncate => raft.single_sync_truncate = true,
+            Bug::TrustDamagedLog => raft.trust_damaged_log = true,
+            Bug::ReadWithoutQuorum => raft.read_without_quorum = true,
+            Bug::SnapshotWithoutSessions => bugs.snapshot_without_sessions = true,
         }
         bugs
     }
@@ -156,11 +187,24 @@ impl FromStr for Bug {
     }
 }
 
+/// One client operation, with the virtual times it was invoked and completed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpRecord {
+    pub client: NodeId,
+    pub op: Op,
+    pub invoked: Time,
+    /// `None` if the client never heard back (it crashed, or the run stopped first).
+    pub completed: Option<(Time, OpResult)>,
+}
+
 /// Everything a run found out.
 #[derive(Clone, Debug)]
 pub struct Outcome {
     pub seed: u64,
     pub violation: Option<Violation>,
+    /// A server that decided its disk was damaged (and stopped voting) although the simulator
+    /// never damaged it: recovery mistook something else for corruption.
+    pub false_alarm: Option<NodeId>,
     pub clients_done: bool,
     pub verdict: Verdict,
     pub operations: usize,
@@ -169,8 +213,15 @@ pub struct Outcome {
     pub end_time: Time,
     pub stats: Stats,
     pub trace_hash: u64,
-    /// One line per event, if the run kept them.
-    pub trace: Option<Vec<String>>,
+    /// Events processed.
+    pub events: u64,
+    /// The faults that were injected, written out (see [`Scenario::script`]).
+    pub script: Script,
+    /// Client operations, in the same order as the checked history (so the indexes in
+    /// [`Verdict::NotLinearizable`] point into this).
+    pub ops: Vec<OpRecord>,
+    /// Every event, if the run kept them.
+    pub trace: Option<Vec<TraceEvent>>,
 }
 
 impl Outcome {
@@ -179,6 +230,12 @@ impl Outcome {
     pub fn failure(&self) -> Option<String> {
         if let Some(v) = &self.violation {
             return Some(format!("safety violation at {}: {v}", self.end_time));
+        }
+        if let Some(node) = self.false_alarm {
+            return Some(format!(
+                "recovery: {node} decided at {} that its disk was damaged, but it never was",
+                self.end_time
+            ));
         }
         if !self.clients_done {
             return Some(format!(
@@ -198,6 +255,25 @@ impl Outcome {
         }
     }
 
+    /// Which check failed: "Raft invariants", "recovery", "liveness" or "linearizability".
+    /// Shrinking keeps a smaller run only if the same check fails. Any Raft property counts as
+    /// the same failure: one bug can break a different property of Figure 3 depending on timing.
+    pub fn failure_kind(&self) -> Option<&'static str> {
+        if self.violation.is_some() {
+            Some("Raft invariants")
+        } else if self.false_alarm.is_some() {
+            Some("recovery")
+        } else if !self.clients_done {
+            Some("liveness")
+        } else {
+            match self.verdict {
+                Verdict::Linearizable => None,
+                Verdict::NotLinearizable { .. } => Some("linearizability"),
+                Verdict::Unknown { .. } => Some("linearizability check budget"),
+            }
+        }
+    }
+
     pub fn passed(&self) -> bool {
         self.failure().is_none()
     }
@@ -212,8 +288,7 @@ impl Outcome {
 
 /// Runs the standard cluster (5 servers, 2 clients doing 30 operations each) for one seed.
 pub fn run_seed(mode: Mode, seed: u64, bug: Option<Bug>, keep_trace: bool) -> Outcome {
-    let config = SimConfig { keep_trace_lines: keep_trace, ..mode.config(seed) };
-    run_cluster(config, SERVERS, OPS, bug.map_or_else(Bugs::default, Bug::bugs))
+    Scenario::new(mode, seed, bug).run(keep_trace)
 }
 
 /// Runs a cluster of `servers` servers; every other node in `config` is a client doing
@@ -225,13 +300,33 @@ pub fn run_cluster(config: SimConfig, servers: u32, ops_per_client: u32, bugs: B
         sim.nodes().filter(|(_, n)| n.as_client().is_some()).map(|(id, _)| id).collect();
     let mut checker = Checker::new();
     let mut recorder = Recorder::default();
+    let mut ops: Vec<OpRecord> = Vec::new();
+    let mut in_flight = BTreeMap::new();
     let mut violation = None;
+    let mut false_alarm = None;
     let mut clients_done = false;
     while sim.step().is_none() {
         // Drain after every step so the history's order matches real time.
-        for &id in &clients {
-            let client = sim.node_mut(id).as_client_mut().expect("client stays a client");
-            for event in client.drain_events() {
+        let now = sim.now();
+        for &client in &clients {
+            let node = sim.node_mut(client).as_client_mut().expect("client stays a client");
+            for event in node.drain_events() {
+                match &event {
+                    ClientEvent::Invoke { id, op } => {
+                        in_flight.insert(*id, ops.len());
+                        ops.push(OpRecord {
+                            client,
+                            op: op.clone(),
+                            invoked: now,
+                            completed: None,
+                        });
+                    }
+                    ClientEvent::Complete { id, result } => {
+                        if let Some(i) = in_flight.remove(id) {
+                            ops[i].completed = Some((now, result.clone()));
+                        }
+                    }
+                }
                 recorder.record(event);
             }
         }
@@ -239,6 +334,16 @@ pub fn run_cluster(config: SimConfig, servers: u32, ops_per_client: u32, bugs: B
         if let Err(v) = checker.check(running.filter_map(|(_, n)| n.as_server()).map(Server::raft))
         {
             violation = Some(v);
+            break;
+        }
+        // Rejoining (no votes until caught up) is only right after real damage; a false alarm
+        // would quietly cost the cluster a voter, and show up much later as lost liveness.
+        false_alarm = sim
+            .nodes()
+            .filter(|&(id, _)| sim.is_up(id) && !sim.was_corrupted(id))
+            .find(|(_, n)| n.as_server().is_some_and(|s| s.raft().is_rejoining()))
+            .map(|(id, _)| id);
+        if false_alarm.is_some() {
             break;
         }
         clients_done = sim
@@ -253,6 +358,7 @@ pub fn run_cluster(config: SimConfig, servers: u32, ops_per_client: u32, bugs: B
     Outcome {
         seed,
         violation,
+        false_alarm,
         clients_done,
         verdict: checker::check(&KvModel, recorder.history(), CHECK_BUDGET),
         operations: recorder.history().ops().len(),
@@ -261,7 +367,10 @@ pub fn run_cluster(config: SimConfig, servers: u32, ops_per_client: u32, bugs: B
         end_time: sim.now(),
         stats: sim.stats(),
         trace_hash: sim.trace().hash(),
-        trace: sim.trace().lines().map(<[String]>::to_vec),
+        events: sim.trace().event_count(),
+        script: sim.script(),
+        ops,
+        trace: sim.trace().events().map(<[TraceEvent]>::to_vec),
     }
 }
 

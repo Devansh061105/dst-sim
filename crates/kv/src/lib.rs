@@ -1,15 +1,16 @@
 //! Linearizable key-value store (get/put/cas) replicated with Raft, plus a retrying client.
 //!
-//! A cluster is `servers` Raft servers (node ids `0..servers`) followed by clients. Every
-//! operation, reads included, goes through the Raft log, so the store behaves like a single
-//! machine (linearizable). Clients tag each operation with a random session id and a sequence
-//! number; servers remember the last result per session, so a retried operation is applied
-//! exactly once.
+//! A cluster is `servers` Raft servers (node ids `0..servers`) followed by clients. Writes go
+//! through the Raft log; reads are answered by the leader once Raft has confirmed it still leads
+//! (ReadIndex), without writing to the log. Either way the store behaves like a single machine
+//! (linearizable). Clients tag each operation with a random session id and a sequence number;
+//! servers remember the last result per session, so a retried write is applied exactly once.
 
 mod client;
 mod command;
 mod model;
 mod server;
+mod wire;
 
 pub use client::{Client, ClientEvent};
 pub use command::{Op, OpResult, RequestId};
@@ -23,6 +24,9 @@ use sim_api::{Context, Node, NodeId, TimerId};
 pub struct Bugs {
     /// Any server answers reads from its own copy instead of going through the Raft log.
     pub local_reads: bool,
+    /// Snapshots hold the store but not the session table, so a server restored from one
+    /// applies a retried write a second time.
+    pub snapshot_without_sessions: bool,
     /// Bugs planted in the Raft layer underneath.
     pub raft: raft::Bugs,
 }

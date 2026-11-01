@@ -17,6 +17,10 @@ pub enum Stream {
     /// Picks a seed's fault mix in [`SimConfig::swarm`](crate::SimConfig::swarm).
     Swarm,
     Buggify(NodeId),
+    /// Restart delays for nodes that halted themselves. Kept apart from [`Stream::Faults`] so
+    /// replaying a written-out fault schedule (which skips the nemesis's draws) restarts nodes at
+    /// the same moments as the original run.
+    Supervisor,
 }
 
 impl Stream {
@@ -26,6 +30,7 @@ impl Stream {
             Stream::Faults => 1,
             Stream::Clocks => 2,
             Stream::Swarm => 3,
+            Stream::Supervisor => 4,
             Stream::Node(node) => (1 << 32) | u64::from(node.0),
             Stream::Disk(node) => (2 << 32) | u64::from(node.0),
             Stream::Buggify(node) => (3 << 32) | u64::from(node.0),

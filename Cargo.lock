@@ -80,9 +80,13 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 name = "dst-cli"
 version = "0.1.0"
 dependencies = [
+ "checker",
  "clap",
  "harness",
+ "kv",
  "rayon",
+ "runtime-real",
+ "sim-api",
  "sim-core",
 ]
 
@@ -186,6 +190,13 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "runtime-real"
+version = "0.1.0"
+dependencies = [
+ "sim-api",
 ]
 
 [[package]]

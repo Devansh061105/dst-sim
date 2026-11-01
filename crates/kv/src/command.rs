@@ -105,6 +105,53 @@ impl Command {
     }
 }
 
+/// The replicated state, as a snapshot holds it: the store and the per-session table of the last
+/// applied write and its result (without the table, a retried write would apply twice).
+pub(crate) type Sessions = BTreeMap<u64, (u64, OpResult)>;
+
+pub(crate) fn encode_state(store: &BTreeMap<u8, u64>, sessions: &Sessions) -> Vec<u8> {
+    let mut out = (store.len() as u64).to_le_bytes().to_vec();
+    for (&key, value) in store {
+        out.push(key);
+        out.extend(value.to_le_bytes());
+    }
+    out.extend((sessions.len() as u64).to_le_bytes());
+    for (session, (seq, result)) in sessions {
+        out.extend(session.to_le_bytes());
+        out.extend(seq.to_le_bytes());
+        match result {
+            OpResult::Value(None) => out.push(0),
+            OpResult::Value(Some(v)) => {
+                out.push(1);
+                out.extend(v.to_le_bytes());
+            }
+            OpResult::Written => out.push(2),
+            OpResult::Cas { swapped } => out.push(3 + u8::from(*swapped)),
+        }
+    }
+    out
+}
+
+/// Decodes a snapshot this crate encoded (checksummed on disk, so malformed input panics).
+pub(crate) fn decode_state(bytes: &[u8]) -> (BTreeMap<u8, u64>, Sessions) {
+    let mut r = Reader(bytes);
+    let store = (0..r.u64()).map(|_| (r.u8(), r.u64())).collect();
+    let sessions = (0..r.u64())
+        .map(|_| {
+            let (session, seq) = (r.u64(), r.u64());
+            let result = match r.u8() {
+                0 => OpResult::Value(None),
+                1 => OpResult::Value(Some(r.u64())),
+                2 => OpResult::Written,
+                tag => OpResult::Cas { swapped: tag == 4 },
+            };
+            (session, (seq, result))
+        })
+        .collect();
+    assert!(r.0.is_empty(), "trailing bytes after snapshot");
+    (store, sessions)
+}
+
 struct Reader<'a>(&'a [u8]);
 
 impl Reader<'_> {
@@ -137,6 +184,20 @@ mod tests {
             let cmd = Command { id, op };
             assert_eq!(Command::decode(&cmd.encode()), cmd);
         }
+    }
+
+    #[test]
+    fn state_round_trips() {
+        let store = BTreeMap::from([(0, 7), (2, u64::MAX)]);
+        let sessions = BTreeMap::from([
+            (1, (3, OpResult::Value(None))),
+            (2, (1, OpResult::Value(Some(9)))),
+            (5, (8, OpResult::Written)),
+            (6, (2, OpResult::Cas { swapped: true })),
+            (7, (4, OpResult::Cas { swapped: false })),
+        ]);
+        assert_eq!(decode_state(&encode_state(&store, &sessions)), (store, sessions));
+        assert_eq!(decode_state(&encode_state(&BTreeMap::new(), &BTreeMap::new())).0.len(), 0);
     }
 
     #[test]

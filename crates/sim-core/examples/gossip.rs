@@ -20,7 +20,7 @@ fn main() {
     let mut sim = Simulation::new(config, |_| Gossip::default());
     let summary = sim.run();
 
-    for line in sim.trace().lines().unwrap_or_default() {
+    for line in sim.trace().events().unwrap_or_default() {
         println!("{line}");
     }
     println!(

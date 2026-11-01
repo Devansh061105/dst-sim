@@ -9,8 +9,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+mod real;
+mod viewer;
+
 use clap::{Parser, Subcommand};
-use harness::{Bug, Mode, Outcome, run_seed};
+use std::path::Path;
+
+use harness::{Bug, Mode, Scenario, run_seed};
 use rayon::prelude::*;
 use sim_core::Stats;
 
@@ -26,17 +31,39 @@ enum Command {
     /// Run one seed. The same seed always replays the same run, so this is also how to debug a
     /// failure that a sweep found.
     Run {
-        #[arg(long)]
-        seed: u64,
+        #[arg(long, required_unless_present = "scenario")]
+        seed: Option<u64>,
         /// calm, chaos or swarm
         #[arg(long, default_value = "chaos")]
         mode: Mode,
         /// Plant a bug (see `dst bugs` for the list)
         #[arg(long)]
         bug: Option<Bug>,
+        /// Replay a scenario file written by `dst shrink` instead of a seed
+        #[arg(long, conflicts_with_all = ["seed", "bug"])]
+        scenario: Option<PathBuf>,
         /// Print every event
         #[arg(long)]
         trace: bool,
+        /// Write the run as a self-contained trace viewer page
+        #[arg(long)]
+        html: Option<PathBuf>,
+        /// Write the run as JSON (open it in viewer/index.html)
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
+    /// Shrink a failing seed to a much smaller run that fails the same way, and save it as a
+    /// scenario file.
+    Shrink {
+        #[arg(long)]
+        seed: u64,
+        #[arg(long, default_value = "chaos")]
+        mode: Mode,
+        #[arg(long)]
+        bug: Option<Bug>,
+        /// Where to save the shrunk scenario (default: shrunk-SEED.txt)
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
     /// Run a range of seeds in parallel and report any that fail.
     Sweep {
@@ -64,30 +91,89 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Run one server of a real cluster, over TCP and real files in DATA.
+    Serve {
+        /// This node's id: an index into --nodes
+        #[arg(long)]
+        id: u32,
+        /// Every node's address, servers first: a comma-separated list, or a port range such as
+        /// 7000-7003 for localhost
+        #[arg(long, value_parser = real::parse_nodes)]
+        nodes: real::Nodes,
+        /// How many of the nodes are servers
+        #[arg(long, default_value_t = 3)]
+        servers: u32,
+        #[arg(long)]
+        data: PathBuf,
+    },
+    /// Run a client against a real cluster, then check what it saw for linearizability.
+    Client {
+        #[arg(long)]
+        id: u32,
+        #[arg(long, value_parser = real::parse_nodes)]
+        nodes: real::Nodes,
+        #[arg(long, default_value_t = 3)]
+        servers: u32,
+        #[arg(long, default_value_t = 200)]
+        ops: u32,
+        /// Give up after this many seconds
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+    },
 }
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::Run { seed, mode, bug, trace } => run(seed, mode, bug, trace),
+        Command::Run { seed, mode, bug, scenario, trace, html, json } => {
+            let scenario = match (scenario, seed) {
+                (Some(path), _) => match load(&path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                (None, Some(seed)) => Scenario::new(mode, seed, bug),
+                (None, None) => unreachable!("clap requires --seed or --scenario"),
+            };
+            run(&scenario, trace, html.as_deref(), json.as_deref())
+        }
+        Command::Shrink { seed, mode, bug, out } => {
+            let out = out.unwrap_or_else(|| PathBuf::from(format!("shrunk-{seed}.txt")));
+            shrink_seed(&Scenario::new(mode, seed, bug), &out)
+        }
         Command::Sweep { seeds, mode, bug, jobs, failures } => {
             pool(jobs).install(|| sweep(seeds, mode, bug, &failures))
         }
         Command::Bugs { seeds, mode, jobs } => pool(jobs).install(|| bugs(seeds, mode)),
+        Command::Serve { id, nodes, servers, data } => real::serve(id, nodes, servers, data),
+        Command::Client { id, nodes, servers, ops, timeout } => {
+            real::client(id, nodes, servers, ops, timeout)
+        }
     }
 }
 
-fn run(seed: u64, mode: Mode, bug: Option<Bug>, trace: bool) -> ExitCode {
-    let outcome = run_seed(mode, seed, bug, trace);
-    for line in outcome.trace.iter().flatten() {
-        println!("{line}");
+fn run(scenario: &Scenario, trace: bool, html: Option<&Path>, json: Option<&Path>) -> ExitCode {
+    let outcome = scenario.run(trace || html.is_some() || json.is_some());
+    if trace {
+        for event in outcome.trace.iter().flatten() {
+            println!("{event}");
+        }
+    }
+    if let Some(path) = html {
+        write_file(path, viewer::page(scenario, &outcome));
+    }
+    if let Some(path) = json {
+        write_file(path, viewer::json(scenario, &outcome));
     }
     println!(
-        "seed {seed} ({mode}{}): {} operations, {} entries committed, max term {}, ended at {}, \
-         trace hash {:#018x}",
-        bug.map(|b| format!(", bug {b}")).unwrap_or_default(),
+        "{}: {} operations, {} entries committed, max term {}, {} events, ended at {}, trace \
+         hash {:#018x}",
+        describe(scenario),
         outcome.operations,
         outcome.committed,
         outcome.max_term,
+        outcome.events,
         outcome.end_time,
         outcome.trace_hash,
     );
@@ -99,10 +185,73 @@ fn run(seed: u64, mode: Mode, bug: Option<Bug>, trace: bool) -> ExitCode {
         }
         Some(failure) => {
             println!("FAIL: {failure}");
-            println!("replay: {}", replay_command(seed, mode, bug));
+            if scenario.script.is_none() {
+                let (seed, mode, bug) = (scenario.seed, scenario.mode, scenario.bug);
+                println!("replay: {}", dst_command("run", seed, mode, bug, " --trace"));
+                println!("shrink: {}", dst_command("shrink", seed, mode, bug, ""));
+            }
             ExitCode::FAILURE
         }
     }
+}
+
+fn shrink_seed(start: &Scenario, out: &Path) -> ExitCode {
+    let started = Instant::now();
+    let shrunk = match harness::shrink(start) {
+        Ok(shrunk) => shrunk,
+        Err(e) => {
+            eprintln!("{}: {e}", describe(start));
+            return ExitCode::FAILURE;
+        }
+    };
+    let faults = |s: &Scenario| s.script.as_ref().map_or(0, |s| s.faults.len());
+    println!("{}: fails with {}", describe(start), shrunk.kind);
+    for step in &shrunk.steps {
+        println!("  {step}");
+    }
+    // With fewer faults a failure can take longer to show, so the run may not get shorter.
+    let size = if shrunk.ratio() > 1.0 {
+        format!("{:.1}x fewer", shrunk.ratio())
+    } else {
+        "the failure now takes longer to show".to_owned()
+    };
+    println!(
+        "shrunk in {:.1} s ({} simulations): {} faults -> {}, {} events -> {} ({size})",
+        started.elapsed().as_secs_f64(),
+        shrunk.runs,
+        faults(&shrunk.original),
+        faults(&shrunk.scenario),
+        shrunk.original_events,
+        shrunk.events,
+    );
+    if let Err(e) = std::fs::write(out, shrunk.scenario.to_string()) {
+        eprintln!("could not write {}: {e}", out.display());
+        return ExitCode::FAILURE;
+    }
+    println!(
+        "saved to {}; replay with: dst run --scenario {} --trace",
+        out.display(),
+        out.display()
+    );
+    ExitCode::SUCCESS
+}
+
+fn write_file(path: &Path, contents: String) {
+    match std::fs::write(path, contents) {
+        Ok(()) => println!("wrote {}", path.display()),
+        Err(e) => eprintln!("could not write {}: {e}", path.display()),
+    }
+}
+
+fn load(path: &Path) -> Result<Scenario, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    text.parse().map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn describe(s: &Scenario) -> String {
+    let bug = s.bug.map(|b| format!(", bug {b}")).unwrap_or_default();
+    let scripted = if s.script.is_some() { ", scripted faults" } else { "" };
+    format!("seed {} ({}{bug}{scripted})", s.seed, s.mode)
 }
 
 fn sweep(seeds: Range<u64>, mode: Mode, bug: Option<Bug>, failures_path: &PathBuf) -> ExitCode {
@@ -145,7 +294,7 @@ fn sweep(seeds: Range<u64>, mode: Mode, bug: Option<Bug>, failures_path: &PathBu
         Ok(()) => println!("failing seeds written to {}", failures_path.display()),
         Err(e) => eprintln!("could not write {}: {e}", failures_path.display()),
     }
-    println!("replay the first: {}", replay_command(failures[0].0, mode, bug));
+    println!("replay the first: {}", dst_command("run", failures[0].0, mode, bug, " --trace"));
     ExitCode::FAILURE
 }
 
@@ -159,7 +308,7 @@ fn bugs(seeds: u64, mode: Mode) -> ExitCode {
             .into_par_iter()
             .filter_map(|seed| {
                 let outcome = run_seed(mode, seed, bug, false);
-                outcome.failure().map(|_| (seed, kind(&outcome)))
+                outcome.failure_kind().map(|kind| (seed, kind))
             })
             .collect();
         let name = bug.map_or_else(|| "(none: correct code)".to_owned(), |b| format!("`{b}`"));
@@ -183,17 +332,6 @@ fn bugs(seeds: u64, mode: Mode) -> ExitCode {
     if all_caught { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
-/// Which check failed first.
-fn kind(outcome: &Outcome) -> &'static str {
-    if outcome.violation.is_some() {
-        "Raft invariants"
-    } else if !outcome.clients_done {
-        "liveness"
-    } else {
-        "linearizability"
-    }
-}
-
 fn most_common(kinds: impl Iterator<Item = &'static str>) -> &'static str {
     let mut counts = std::collections::BTreeMap::new();
     for k in kinds {
@@ -205,7 +343,7 @@ fn most_common(kinds: impl Iterator<Item = &'static str>) -> &'static str {
 fn faults(s: &Stats) -> String {
     format!(
         "faults: {} crashes, {} halts, {} partitions, {} lost messages, {} duplicated, {} fsync \
-         failures, {} crashes mid-fsync, {} torn writes",
+         failures, {} crashes mid-fsync, {} torn writes, {} corrupted disks",
         s.crashes,
         s.halts,
         s.partitions,
@@ -213,13 +351,15 @@ fn faults(s: &Stats) -> String {
         s.duplicated,
         s.sync_failures,
         s.sync_crashes,
-        s.torn_writes
+        s.torn_writes,
+        s.corruptions
     )
 }
 
-fn replay_command(seed: u64, mode: Mode, bug: Option<Bug>) -> String {
+/// A `dst` command line for one seed, runnable from the repository.
+fn dst_command(command: &str, seed: u64, mode: Mode, bug: Option<Bug>, extra: &str) -> String {
     let bug = bug.map(|b| format!(" --bug {b}")).unwrap_or_default();
-    format!("cargo run --release -p dst-cli -- run --seed {seed} --mode {mode}{bug} --trace")
+    format!("cargo run --release -p dst-cli -- {command} --seed {seed} --mode {mode}{bug}{extra}")
 }
 
 fn parse_range(s: &str) -> Result<Range<u64>, String> {

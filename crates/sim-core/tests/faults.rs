@@ -16,6 +16,10 @@ fn set(nodes: &[u32]) -> BTreeSet<NodeId> {
     nodes.iter().copied().map(NodeId).collect()
 }
 
+fn trace_lines(sim: &Simulation<Gossip>) -> Vec<String> {
+    sim.trace().events().expect("trace kept").iter().map(ToString::to_string).collect()
+}
+
 fn at(secs: u64) -> Time {
     Time::ZERO + Duration::from_secs(secs)
 }
@@ -87,7 +91,7 @@ fn crash_stops_node_and_restart_recovers() {
     sim.inject(Fault::Crash(NodeId(0)));
     sim.run_until(at(4));
     {
-        let lines = sim.trace().lines().unwrap();
+        let lines = trace_lines(&sim);
         let crash = lines.iter().position(|l| l.ends_with("fault crash n0")).unwrap();
         let after = &lines[crash + 1..];
         assert!(!after.iter().any(|l| l.contains("] n0 timer") || l.contains("] n0 <- ")));
@@ -100,7 +104,7 @@ fn crash_stops_node_and_restart_recovers() {
     assert_eq!(sim.run().stop, StopReason::Quiescent);
     assert!(sim.nodes().all(|(_, n)| n.known() == &ids(3)));
 
-    let lines = sim.trace().lines().unwrap();
+    let lines = trace_lines(&sim);
     let starts =
         |node: &str| lines.iter().filter(|l| l.ends_with(&format!("{node} start"))).count();
     assert_eq!(starts("n0"), 2, "boot + restart");

@@ -10,10 +10,14 @@ name = "dst"
 path = "src/main.rs"
 
 [dependencies]
+checker = { workspace = true }
 harness = { workspace = true }
+kv = { workspace = true }
 sim-core = { workspace = true }
 clap = { workspace = true }
 rayon = { workspace = true }
+runtime-real = { workspace = true }
+sim-api = { workspace = true }
 
 [lints]
 workspace = true

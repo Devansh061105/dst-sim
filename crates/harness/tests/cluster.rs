@@ -20,7 +20,10 @@ fn fault_free_cluster_serves_every_client() {
     for seed in 0..20 {
         let outcome = run_seed(Mode::Calm, seed, None, false);
         outcome.assert_healthy();
-        assert!(outcome.committed >= (2 * OPS) as usize, "seed {seed}: {}", outcome.committed);
+        assert_eq!(outcome.ops.len(), (2 * OPS) as usize, "seed {seed}");
+        // Every write is in the log; reads are not (ReadIndex).
+        let writes = outcome.ops.iter().filter(|o| !matches!(o.op, kv::Op::Get { .. })).count();
+        assert!(outcome.committed > writes, "seed {seed}: {} for {writes}", outcome.committed);
     }
 }
 
@@ -39,6 +42,8 @@ fn survives_chaos() {
         total.sync_crashes > 0 && total.torn_writes > 0 && total.unsynced_survived > 0,
         "{total:?}"
     );
+    // Damaged disks: every one must have been noticed and repaired from the other servers.
+    assert!(total.corruptions > 0, "{total:?}");
 }
 
 #[test]
@@ -102,12 +107,13 @@ fn histories_are_recorded_and_complete_without_faults() {
     assert_eq!(SERVERS + 2, NODES);
 }
 
-/// Regression: this swarm seed once failed on correct code because the checker demanded that a
-/// stale leader of an older term hold entries committed in a newer term, which Raft doesn't
-/// promise. The checker was fixed, not Raft.
+/// Regression: in this swarm seed a stale leader of an older term lacks an entry committed in a
+/// newer term. Raft allows that, but the first version of the checker flagged it (found at swarm
+/// seed 11644; 9588 is a seed with the same situation after the simulator's random streams
+/// changed). The checker was fixed, not Raft.
 #[test]
 fn stale_leader_of_older_term_is_not_a_violation() {
-    run_seed(Mode::Swarm, 11644, None, false).assert_healthy();
+    run_seed(Mode::Swarm, 9588, None, false).assert_healthy();
 }
 
 fn caught_within(bug: Bug, mode: Mode, seeds: u64) -> Option<u64> {
@@ -122,6 +128,7 @@ fn quickly_found_planted_bugs_are_caught() {
         Bug::SkipAppendFsync,
         Bug::VoteWithoutLogCheck,
         Bug::LocalReads,
+        Bug::TrustDamagedLog,
     ] {
         assert!(caught_within(bug, Mode::Chaos, 100).is_some(), "{bug} not caught in 100 seeds");
     }
@@ -133,4 +140,20 @@ fn quickly_found_planted_bugs_are_caught() {
 #[ignore = "thousands of seeds; run with --release -- --ignored"]
 fn commit_beyond_match_is_caught_by_swarm() {
     assert!(caught_within(Bug::CommitBeyondMatch, Mode::Swarm, 5_000).is_some());
+}
+
+/// Needs a leader cut off by a partition that still serves a read after a new leader has taken a
+/// write: about one seed in a thousand.
+#[test]
+#[ignore = "thousands of seeds; run with --release -- --ignored"]
+fn reads_without_a_leadership_check_are_caught() {
+    assert!(caught_within(Bug::ReadWithoutQuorum, Mode::Chaos, 5_000).is_some());
+}
+
+/// Needs a server restored from a snapshot (after a restart, or installed from the leader) to
+/// receive a retry of a write it already applied: a few seeds in a thousand.
+#[test]
+#[ignore = "thousands of seeds; run with --release -- --ignored"]
+fn snapshots_without_the_session_table_are_caught() {
+    assert!(caught_within(Bug::SnapshotWithoutSessions, Mode::Swarm, 5_000).is_some());
 }

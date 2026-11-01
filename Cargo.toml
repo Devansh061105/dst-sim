@@ -17,6 +17,7 @@ checker = { path = "crates/checker" }
 raft = { path = "crates/raft" }
 kv = { path = "crates/kv" }
 harness = { path = "crates/harness" }
+runtime-real = { path = "crates/runtime-real" }
 
 # External crates (keep this list short: disk space is limited).
 rand_chacha = { version = "0.10", default-features = false }

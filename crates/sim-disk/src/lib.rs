@@ -24,6 +24,10 @@ pub struct DiskConfig {
     /// the sync never completes, and the crash decides which of those operations reached the
     /// disk (possibly torn). The simulator stops the node at that point.
     pub crash_during_sync: f64,
+    /// The probability that a crash also damages data already on disk: one bit flips (bit rot)
+    /// or a span of bytes lands in the wrong place (the effect of a misdirected write). Applied by
+    /// the simulator, which decides which crashes may corrupt (see [`Disk::corrupt_at_rest`]).
+    pub corrupt: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +51,24 @@ pub struct CrashReport {
     pub lost: u64,
 }
 
+/// Damage done to data at rest by [`Disk::corrupt_at_rest`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Corruption {
+    pub file: String,
+    /// First damaged byte.
+    pub offset: u64,
+    pub kind: CorruptionKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CorruptionKind {
+    /// One bit of the byte at `offset` flipped.
+    BitFlip,
+    /// `len` bytes copied from offset `from` over the bytes at `offset`, as a write that went to
+    /// the wrong place would leave them.
+    Misplaced { from: u64, len: u64 },
+}
+
 /// A failed sync, kept until the simulator collects it for the trace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyncFailure {
@@ -66,8 +88,9 @@ pub struct Disk {
 
 impl Disk {
     pub fn new(config: DiskConfig) -> Self {
-        let DiskConfig { unsynced_survive, torn_write, sync_fail, crash_during_sync } = config;
-        for p in [unsynced_survive, torn_write, sync_fail, crash_during_sync] {
+        let DiskConfig { unsynced_survive, torn_write, sync_fail, crash_during_sync, corrupt } =
+            config;
+        for p in [unsynced_survive, torn_write, sync_fail, crash_during_sync, corrupt] {
             assert!((0.0..=1.0).contains(&p), "probability {p} is outside [0, 1]");
         }
         Disk { config, files: BTreeMap::new(), sync_failures: Vec::new(), crashed_in_sync: false }
@@ -145,6 +168,47 @@ impl Disk {
             f.visible.clone_from(&f.durable);
         }
         report
+    }
+
+    /// With probability `corrupt`, damages one random spot of one file: flips a bit, or copies a
+    /// span of up to 64 bytes over another part of the same file. Meant to be called right after
+    /// a crash that left nothing unsynced, so corruption only ever hits data that was on disk.
+    pub fn corrupt_at_rest(&mut self, rand: &mut impl Rand) -> Option<Corruption> {
+        if !rand.chance(self.config.corrupt) {
+            return None;
+        }
+        let files: Vec<&String> = self
+            .files
+            .iter()
+            .filter(|(_, f)| !f.durable.is_empty())
+            .map(|(name, _)| name)
+            .collect();
+        if files.is_empty() {
+            return None;
+        }
+        let name = files[rand.below(files.len() as u64) as usize].clone();
+        let f = self.files.get_mut(&name).expect("file exists");
+        let size = f.durable.len() as u64;
+        let offset = rand.below(size);
+        let kind = if rand.chance(0.5) {
+            f.durable[offset as usize] ^= 1 << rand.below(8);
+            CorruptionKind::BitFlip
+        } else {
+            let len = (1 + rand.below(64)).min(size - offset);
+            let from = rand.below(size - len + 1);
+            f.durable.copy_within(from as usize..(from + len) as usize, offset as usize);
+            CorruptionKind::Misplaced { from, len }
+        };
+        f.visible.clone_from(&f.durable);
+        Some(Corruption { file: name, offset, kind })
+    }
+
+    /// From now on, syncs never fail and data at rest is never damaged (the simulator's calm
+    /// period: faults stop, so a correct system must recover).
+    pub fn calm(&mut self) {
+        self.config.sync_fail = 0.0;
+        self.config.crash_during_sync = 0.0;
+        self.config.corrupt = 0.0;
     }
 
     /// Sync failures since the last call, for the simulator's trace and stats.
@@ -272,6 +336,34 @@ mod tests {
         d.write("f", 0, b"0123456789");
         assert_eq!(d.crash(&mut Lcg(7)).torn, 1);
         assert!(b"0123456789".starts_with(d.read("f")), "a torn write leaves a prefix");
+    }
+
+    #[test]
+    fn corruption_damages_one_spot_of_data_at_rest() {
+        let original: Vec<u8> = (0..200).collect();
+        let mut kinds = Vec::new();
+        for seed in 0..50 {
+            let mut d = disk(DiskConfig { corrupt: 1.0, ..DiskConfig::default() });
+            let mut rand = Lcg(seed);
+            d.write("f", 0, &original);
+            d.sync("f", &mut rand).unwrap();
+            let c = d.corrupt_at_rest(&mut rand).expect("p = 1 always corrupts");
+            assert_eq!(c.file, "f");
+            let changed: Vec<usize> = (0..200).filter(|&i| d.read("f")[i] != original[i]).collect();
+            assert_eq!(d.read("f").len(), 200, "corruption never changes a file's size");
+            if let Some(&first) = changed.first() {
+                assert!(
+                    first as u64 >= c.offset && changed.len() <= 64,
+                    "{c:?} changed {changed:?}"
+                );
+            }
+            kinds.push(matches!(c.kind, CorruptionKind::BitFlip));
+        }
+        assert!(kinds.contains(&true) && kinds.contains(&false), "both kinds happen");
+
+        let mut d = disk(DiskConfig::default());
+        d.write("f", 0, b"data");
+        assert_eq!(d.corrupt_at_rest(&mut Lcg(1)), None, "p = 0 never corrupts");
     }
 
     #[test]

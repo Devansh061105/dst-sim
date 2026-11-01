@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use sim_api::{Context, Node, NodeId, Rand, Storage, SyncError, Time, TimerId};
@@ -6,7 +6,7 @@ use sim_disk::{CrashReport, Disk, DiskConfig, DiskIo};
 use sim_net::{NetConfig, Network, Route};
 
 use crate::clock::{Clock, ClockConfig};
-use crate::faults::{self, Fault, FaultConfig};
+use crate::faults::{self, Fault, FaultConfig, Script};
 use crate::queue::EventQueue;
 use crate::rng::{SimRng, Stream};
 use crate::trace::{DropReason, Entry, Trace};
@@ -61,6 +61,7 @@ impl SimConfig {
                 partitions: true,
                 crashes: true,
                 max_down: nodes.saturating_sub(1) / 2,
+                max_corrupted: nodes.saturating_sub(1) / 2,
                 ..FaultConfig::none()
             },
             clocks: ClockConfig { max_offset: Duration::from_secs(1), max_drift_ppm: 50_000 },
@@ -69,6 +70,7 @@ impl SimConfig {
                 torn_write: 0.3,
                 sync_fail: 0.005,
                 crash_during_sync: 0.005,
+                corrupt: 0.05,
             },
             ..SimConfig::new(seed, nodes)
         }
@@ -92,6 +94,7 @@ impl SimConfig {
             torn_write: pick(&[0.0, 0.3, 1.0]),
             sync_fail: pick(&[0.0, 0.005, 0.02]),
             crash_during_sync: pick(&[0.0, 0.005, 0.02]),
+            corrupt: pick(&[0.0, 0.05, 0.3]),
         };
         let buggify = pick(&[0.0, 0.05]);
         let max_drift_ppm = pick(&[0.0, 10_000.0, 50_000.0]) as u32;
@@ -103,6 +106,7 @@ impl SimConfig {
             partitions: r.chance(0.5),
             crashes: r.chance(0.5),
             max_down: nodes.saturating_sub(1) / 2,
+            max_corrupted: nodes.saturating_sub(1) / 2,
             interval,
             ..FaultConfig::none()
         };
@@ -149,6 +153,8 @@ pub struct Stats {
     /// Unsynced disk operations that reached the disk before a crash anyway.
     pub unsynced_survived: u64,
     pub torn_writes: u64,
+    /// Crashes that also damaged data already on disk.
+    pub corruptions: u64,
 }
 
 /// Adds up the counts of several runs.
@@ -169,6 +175,7 @@ impl std::ops::AddAssign for Stats {
             unsynced_lost,
             unsynced_survived,
             torn_writes,
+            corruptions,
         } = other;
         self.delivered += delivered;
         self.lost += lost;
@@ -184,6 +191,7 @@ impl std::ops::AddAssign for Stats {
         self.unsynced_lost += unsynced_lost;
         self.unsynced_survived += unsynced_survived;
         self.torn_writes += torn_writes;
+        self.corruptions += corruptions;
     }
 }
 
@@ -204,6 +212,7 @@ enum Event<M, T> {
     Deliver {
         from: NodeId,
         to: NodeId,
+        sent: Time,
         msg: M,
     },
     Timer {
@@ -212,6 +221,8 @@ enum Event<M, T> {
         timer: T,
     },
     Nemesis,
+    /// A fault from a written-out schedule ([`FaultConfig::script`]).
+    Scripted(Fault),
     /// The supervisor restarting a node that halted itself.
     Restart {
         node: NodeId,
@@ -243,11 +254,18 @@ pub struct Simulation<N: Node> {
     /// One disk per node. Disks outlive crashes; that is how a restarted node recovers.
     disks: Vec<Disk>,
     disk_rngs: Vec<SimRng>,
+    /// Nodes whose disks have been corrupted, once each (at most `faults.max_corrupted`).
+    corrupted: BTreeSet<NodeId>,
     node_rngs: Vec<SimRng>,
     /// Kept apart from `node_rngs` so turning BUGGIFY on doesn't shift a node's own randomness.
     buggify_rngs: Vec<SimRng>,
     net_rng: SimRng,
     fault_rng: SimRng,
+    supervisor_rng: SimRng,
+    /// Every fault the nemesis (or a script) injected, so the run can be replayed from a script.
+    injected: Vec<(Time, Fault)>,
+    /// When the faults ended, once they have.
+    calmed_at: Option<Time>,
     network: Network,
     queue: EventQueue<Event<N::Message, N::Timer>>,
     /// Pending timers and the node that owns each.
@@ -278,14 +296,22 @@ impl<N: Node> Simulation<N> {
         for &node in &ids {
             queue.push(Time::ZERO, Event::Start { node, incarnation: 0 });
         }
-        if config.faults.enabled() {
+        let mut faults_end = Time::ZERO + config.faults.active_for;
+        if let Some(script) = &config.faults.script {
+            for (at, fault) in script.faults.iter().filter(|(at, _)| *at < script.calm_at) {
+                queue.push(*at, Event::Scripted(fault.clone()));
+            }
+            // The one nemesis event: the calm period.
+            faults_end = script.calm_at;
+            queue.push(faults_end, Event::Nemesis);
+        } else if config.faults.enabled() {
             let first = fault_rng.duration_in(config.faults.interval.clone());
             queue.push(Time::ZERO + first, Event::Nemesis);
         }
 
         Simulation {
             deadline: Time::ZERO + config.max_time,
-            faults_end: Time::ZERO + config.faults.active_for,
+            faults_end,
             now: Time::ZERO,
             steps: 0,
             nodes,
@@ -295,10 +321,14 @@ impl<N: Node> Simulation<N> {
             clocks,
             disks,
             disk_rngs,
+            corrupted: BTreeSet::new(),
             node_rngs,
             buggify_rngs,
             net_rng: SimRng::new(config.seed, Stream::Network),
             fault_rng,
+            supervisor_rng: SimRng::new(config.seed, Stream::Supervisor),
+            injected: Vec::new(),
+            calmed_at: None,
             network: Network::new(config.net.clone()),
             queue,
             active_timers: BTreeMap::new(),
@@ -356,7 +386,10 @@ impl<N: Node> Simulation<N> {
             }
             // The nemesis may already have restarted it.
             Event::Restart { node } => !self.up[node.0 as usize],
-            Event::Deliver { .. } | Event::Nemesis => true,
+            // A scripted fault that no longer applies (the schedule was edited) is skipped.
+            Event::Scripted(Fault::Crash(node)) => self.up[node.0 as usize],
+            Event::Scripted(Fault::Restart(node)) => !self.up[node.0 as usize],
+            Event::Deliver { .. } | Event::Nemesis | Event::Scripted(_) => true,
         };
         if !live {
             return None;
@@ -369,13 +402,14 @@ impl<N: Node> Simulation<N> {
                 self.trace.record::<N::Message, N::Timer>(at, &Entry::Start { node });
                 self.dispatch(node, |n, ctx| n.on_start(ctx));
             }
-            Event::Deliver { from, to, msg } => {
+            Event::Deliver { from, to, sent, msg } => {
                 if self.up[to.0 as usize] {
                     self.stats.delivered += 1;
-                    self.trace.record::<_, N::Timer>(at, &Entry::Deliver { from, to, msg: &msg });
+                    let entry = Entry::Deliver { from, to, sent, msg: &msg };
+                    self.trace.record::<_, N::Timer>(at, &entry);
                     self.dispatch(to, |n, ctx| n.on_message(ctx, from, msg));
                 } else {
-                    self.drop_message(from, to, DropReason::NodeDown, &msg);
+                    self.drop_message(from, to, sent, DropReason::NodeDown, &msg);
                 }
             }
             Event::Timer { node, id, timer } => {
@@ -383,9 +417,19 @@ impl<N: Node> Simulation<N> {
                 self.dispatch(node, |n, ctx| n.on_timer(ctx, id, timer));
             }
             Event::Nemesis => self.nemesis(),
+            Event::Scripted(fault) => {
+                self.injected.push((at, fault.clone()));
+                self.inject(fault);
+            }
             Event::Restart { node } => self.inject(Fault::Restart(node)),
         }
         None
+    }
+
+    /// The faults injected so far, written out. Replaying it (as [`FaultConfig::script`], with
+    /// the rest of the config unchanged) reproduces this run.
+    pub fn script(&self) -> Script {
+        Script { faults: self.injected.clone(), calm_at: self.calmed_at.unwrap_or(self.faults_end) }
     }
 
     /// Applies a fault right now. The nemesis calls this on its own schedule; tests call it to
@@ -453,6 +497,11 @@ impl<N: Node> Simulation<N> {
         self.stats
     }
 
+    /// Whether this node's disk has been corrupted ([`DiskConfig::corrupt`](sim_disk::DiskConfig)).
+    pub fn was_corrupted(&self, id: NodeId) -> bool {
+        self.corrupted.contains(&id)
+    }
+
     /// A node's disk, for inspecting what is durable.
     pub fn disk(&self, id: NodeId) -> &Disk {
         &self.disks[id.0 as usize]
@@ -474,6 +523,19 @@ impl<N: Node> Simulation<N> {
         self.stats.torn_writes += report.torn;
         if report != CrashReport::default() {
             self.trace.record::<N::Message, N::Timer>(self.now, &Entry::DiskCrash { node, report });
+        } else if !self.corrupted.contains(&node)
+            && (self.corrupted.len() as u32) < self.config.faults.max_corrupted
+        {
+            // Only after a crash that left nothing unsynced, so corruption and torn writes stay
+            // separate faults: corruption only ever hits data that was already on disk.
+            if let Some(corruption) = self.disks[i].corrupt_at_rest(&mut self.disk_rngs[i]) {
+                self.corrupted.insert(node);
+                self.stats.corruptions += 1;
+                self.trace.record::<N::Message, N::Timer>(
+                    self.now,
+                    &Entry::Corrupt { node, corruption: &corruption },
+                );
+            }
         }
     }
 
@@ -482,13 +544,19 @@ impl<N: Node> Simulation<N> {
         self.stats.halts += 1;
         self.trace.record::<N::Message, N::Timer>(self.now, &Entry::Halt { node });
         self.crash_node(node);
-        let delay = self.fault_rng.duration_in(self.config.faults.restart_delay.clone());
+        let delay = self.supervisor_rng.duration_in(self.config.faults.restart_delay.clone());
         self.queue.push(self.now + delay, Event::Restart { node });
     }
 
     fn nemesis(&mut self) {
         if self.now >= self.faults_end {
-            // Faults are over: undo them all so tests can check the system recovers.
+            // Faults are over: undo them all so tests can check the system recovers. Disks stop
+            // failing too: a disk that fails a few percent of fsyncs forever is a fault that never
+            // ends, and no system can promise progress through that.
+            self.calmed_at = Some(self.now);
+            for disk in &mut self.disks {
+                disk.calm();
+            }
             if !self.network.is_healed() {
                 self.inject(Fault::Heal);
             }
@@ -501,6 +569,7 @@ impl<N: Node> Simulation<N> {
         if let Some(fault) =
             faults::choose(&self.config.faults, &self.ids, &self.up, &mut self.fault_rng)
         {
+            self.injected.push((self.now, fault.clone()));
             self.inject(fault);
         }
         let gap = self.fault_rng.duration_in(self.config.faults.interval.clone());
@@ -525,6 +594,7 @@ impl<N: Node> Simulation<N> {
             next_timer_id: &mut self.next_timer_id,
             effects: Vec::new(),
             sync_crashes: 0,
+            halted: false,
         };
         callback(&mut self.nodes[idx], &mut ctx);
         self.stats.sync_crashes += ctx.sync_crashes;
@@ -547,19 +617,20 @@ impl<N: Node> Simulation<N> {
         match effect {
             Effect::Send { to, msg } => {
                 assert!(to.0 < self.config.nodes, "{from} sent to unknown node {to}");
+                let sent = self.now;
                 match self.network.route(from, to, &mut self.net_rng) {
                     Route::Deliver(delay) => {
-                        self.queue.push(self.now + delay, Event::Deliver { from, to, msg });
+                        self.queue.push(sent + delay, Event::Deliver { from, to, sent, msg });
                     }
                     Route::Duplicate(first, second) => {
                         self.stats.duplicated += 1;
-                        let copy = Event::Deliver { from, to, msg: msg.clone() };
-                        self.queue.push(self.now + first, copy);
-                        self.queue.push(self.now + second, Event::Deliver { from, to, msg });
+                        let copy = Event::Deliver { from, to, sent, msg: msg.clone() };
+                        self.queue.push(sent + first, copy);
+                        self.queue.push(sent + second, Event::Deliver { from, to, sent, msg });
                     }
-                    Route::Lost => self.drop_message(from, to, DropReason::Lost, &msg),
+                    Route::Lost => self.drop_message(from, to, sent, DropReason::Lost, &msg),
                     Route::Partitioned => {
-                        self.drop_message(from, to, DropReason::Partitioned, &msg)
+                        self.drop_message(from, to, sent, DropReason::Partitioned, &msg)
                     }
                 }
             }
@@ -576,13 +647,20 @@ impl<N: Node> Simulation<N> {
         }
     }
 
-    fn drop_message(&mut self, from: NodeId, to: NodeId, reason: DropReason, msg: &N::Message) {
+    fn drop_message(
+        &mut self,
+        from: NodeId,
+        to: NodeId,
+        sent: Time,
+        reason: DropReason,
+        msg: &N::Message,
+    ) {
         match reason {
             DropReason::Lost => self.stats.lost += 1,
             DropReason::Partitioned => self.stats.partitioned += 1,
             DropReason::NodeDown => self.stats.to_down_node += 1,
         }
-        self.trace.record::<_, N::Timer>(self.now, &Entry::Drop { from, to, reason, msg });
+        self.trace.record::<_, N::Timer>(self.now, &Entry::Drop { from, to, sent, reason, msg });
     }
 }
 
@@ -599,6 +677,9 @@ struct SimContext<'a, M, T> {
     next_timer_id: &'a mut u64,
     effects: Vec<Effect<M, T>>,
     sync_crashes: u64,
+    /// The node halted (or died mid-sync): the process is gone, so the rest of the callback
+    /// touches nothing. In particular it must not keep writing after a failed sync.
+    halted: bool,
 }
 
 // Disk calls go through the context (rather than straight to the `DiskIo`) so that a crash in the
@@ -614,18 +695,25 @@ impl<M, T> Storage for SimContext<'_, M, T> {
     }
 
     fn write(&mut self, file: &str, offset: u64, data: &[u8]) {
-        self.storage.write(file, offset, data);
+        if !self.halted {
+            self.storage.write(file, offset, data);
+        }
     }
 
     fn truncate(&mut self, file: &str, len: u64) {
-        self.storage.truncate(file, len);
+        if !self.halted {
+            self.storage.truncate(file, len);
+        }
     }
 
     fn sync(&mut self, file: &str) -> Result<(), SyncError> {
+        if self.halted {
+            return Err(SyncError);
+        }
         let result = self.storage.sync(file);
         if self.storage.disk.take_crash_in_sync() {
             self.sync_crashes += 1;
-            self.effects.push(Effect::Halt);
+            self.halt();
         }
         result
     }
@@ -664,6 +752,7 @@ impl<M, T> Context<M, T> for SimContext<'_, M, T> {
     }
 
     fn halt(&mut self) {
+        self.halted = true;
         self.effects.push(Effect::Halt);
     }
 

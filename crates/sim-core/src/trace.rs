@@ -3,24 +3,24 @@ use std::hash::{Hash, Hasher};
 
 use sim_api::{NodeId, Time, TimerId};
 
-use sim_disk::CrashReport;
+use sim_disk::{Corruption, CorruptionKind, CrashReport};
 
 use crate::faults::Fault;
 
-/// Record of a run: a running hash of every processed event, plus optional readable lines.
+/// Record of a run: a running hash of every processed event, plus, optionally, the events.
 ///
 /// Two runs with the same hash processed the same events, in the same order, at the same virtual
 /// times. Comparing hashes is how determinism is checked.
 #[derive(Debug)]
 pub struct Trace {
     hasher: Fnv1a,
-    events: u64,
-    lines: Option<Vec<String>>,
+    count: u64,
+    events: Option<Vec<TraceEvent>>,
 }
 
 impl Trace {
-    pub(crate) fn new(keep_lines: bool) -> Self {
-        Trace { hasher: Fnv1a::default(), events: 0, lines: keep_lines.then(Vec::new) }
+    pub(crate) fn new(keep_events: bool) -> Self {
+        Trace { hasher: Fnv1a::default(), count: 0, events: keep_events.then(Vec::new) }
     }
 
     pub(crate) fn record<M: Hash + fmt::Debug, T: Hash + fmt::Debug>(
@@ -30,9 +30,9 @@ impl Trace {
     ) {
         self.hasher.write_u64(at.as_nanos());
         entry.hash_into(&mut self.hasher);
-        self.events += 1;
-        if let Some(lines) = &mut self.lines {
-            lines.push(format!("[{at}] {entry}"));
+        self.count += 1;
+        if let Some(events) = &mut self.events {
+            events.push(TraceEvent { at, kind: entry.kind(), text: entry.to_string() });
         }
     }
 
@@ -42,18 +42,48 @@ impl Trace {
     }
 
     pub fn event_count(&self) -> u64 {
-        self.events
+        self.count
     }
 
-    /// One line per event, if the run was configured to keep them.
-    pub fn lines(&self) -> Option<&[String]> {
-        self.lines.as_deref()
+    /// Every event, if the run was configured to keep them.
+    pub fn events(&self) -> Option<&[TraceEvent]> {
+        self.events.as_deref()
     }
 }
 
+/// One processed event, as kept for printing or for the trace viewer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceEvent {
+    pub at: Time,
+    pub kind: EventKind,
+    /// What happened, readably, e.g. `n1 <- n0 Raft(RequestVote { .. })`.
+    pub text: String,
+}
+
+impl fmt::Display for TraceEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{}] {}", self.at, self.text)
+    }
+}
+
+/// The structured part of a [`TraceEvent`]: which nodes it involves and, for messages, when they
+/// were sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EventKind {
+    Start { node: NodeId },
+    Deliver { from: NodeId, to: NodeId, sent: Time },
+    Timer { node: NodeId },
+    Fault(Fault),
+    Drop { from: NodeId, to: NodeId, sent: Time, reason: DropReason },
+    DiskCrash { node: NodeId },
+    SyncFailed { node: NodeId },
+    Halt { node: NodeId },
+    Corrupt { node: NodeId },
+}
+
 /// Why a message never reached its destination.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum DropReason {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropReason {
     Lost,
     Partitioned,
     NodeDown,
@@ -62,24 +92,45 @@ pub(crate) enum DropReason {
 /// One processed event, borrowed from the simulator just long enough to record it.
 pub(crate) enum Entry<'a, M, T> {
     Start { node: NodeId },
-    Deliver { from: NodeId, to: NodeId, msg: &'a M },
+    Deliver { from: NodeId, to: NodeId, sent: Time, msg: &'a M },
     Timer { node: NodeId, id: TimerId, timer: &'a T },
     Fault(&'a Fault),
-    Drop { from: NodeId, to: NodeId, reason: DropReason, msg: &'a M },
+    Drop { from: NodeId, to: NodeId, sent: Time, reason: DropReason, msg: &'a M },
     DiskCrash { node: NodeId, report: CrashReport },
     SyncFailed { node: NodeId, file: &'a str, dropped: u64 },
     Halt { node: NodeId },
+    Corrupt { node: NodeId, corruption: &'a Corruption },
+}
+
+impl<M, T> Entry<'_, M, T> {
+    fn kind(&self) -> EventKind {
+        match *self {
+            Entry::Start { node } => EventKind::Start { node },
+            Entry::Deliver { from, to, sent, .. } => EventKind::Deliver { from, to, sent },
+            Entry::Timer { node, .. } => EventKind::Timer { node },
+            Entry::Fault(fault) => EventKind::Fault(fault.clone()),
+            Entry::Drop { from, to, sent, reason, .. } => {
+                EventKind::Drop { from, to, sent, reason }
+            }
+            Entry::DiskCrash { node, .. } => EventKind::DiskCrash { node },
+            Entry::SyncFailed { node, .. } => EventKind::SyncFailed { node },
+            Entry::Halt { node } => EventKind::Halt { node },
+            Entry::Corrupt { node, .. } => EventKind::Corrupt { node },
+        }
+    }
 }
 
 impl<M: Hash, T: Hash> Entry<'_, M, T> {
-    // Written by hand rather than derived so the byte layout is fixed by this code alone.
+    // Written by hand rather than derived so the byte layout is fixed by this code alone. Send
+    // times are left out: they follow from earlier events, and leaving them out keeps the hashes
+    // of earlier versions valid.
     fn hash_into(&self, h: &mut Fnv1a) {
         match self {
             Entry::Start { node } => {
                 h.write_u8(0);
                 h.write_u32(node.0);
             }
-            Entry::Deliver { from, to, msg } => {
+            Entry::Deliver { from, to, msg, .. } => {
                 h.write_u8(1);
                 h.write_u32(from.0);
                 h.write_u32(to.0);
@@ -95,7 +146,7 @@ impl<M: Hash, T: Hash> Entry<'_, M, T> {
                 h.write_u8(3);
                 fault.hash_into(h);
             }
-            Entry::Drop { from, to, reason, msg } => {
+            Entry::Drop { from, to, reason, msg, .. } => {
                 h.write_u8(4);
                 h.write_u32(from.0);
                 h.write_u32(to.0);
@@ -119,6 +170,12 @@ impl<M: Hash, T: Hash> Entry<'_, M, T> {
                 h.write_u8(7);
                 h.write_u32(node.0);
             }
+            Entry::Corrupt { node, corruption } => {
+                h.write_u8(8);
+                h.write_u32(node.0);
+                h.write(corruption.file.as_bytes());
+                h.write_u64(corruption.offset);
+            }
         }
     }
 }
@@ -127,10 +184,10 @@ impl<M: fmt::Debug, T: fmt::Debug> fmt::Display for Entry<'_, M, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Entry::Start { node } => write!(f, "{node} start"),
-            Entry::Deliver { from, to, msg } => write!(f, "{to} <- {from} {msg:?}"),
+            Entry::Deliver { from, to, msg, .. } => write!(f, "{to} <- {from} {msg:?}"),
             Entry::Timer { node, timer, .. } => write!(f, "{node} timer {timer:?}"),
             Entry::Fault(fault) => write!(f, "fault {fault}"),
-            Entry::Drop { from, to, reason, msg } => {
+            Entry::Drop { from, to, reason, msg, .. } => {
                 write!(f, "{to} <-x- {from} {reason:?} {msg:?}")
             }
             Entry::DiskCrash { node, report } => write!(
@@ -142,6 +199,15 @@ impl<M: fmt::Debug, T: fmt::Debug> fmt::Display for Entry<'_, M, T> {
                 write!(f, "{node} disk sync failed on {file}, {dropped} ops dropped")
             }
             Entry::Halt { node } => write!(f, "{node} halted; restart scheduled"),
+            Entry::Corrupt { node, corruption: c } => {
+                write!(f, "{node} disk corrupted: {} at byte {}, ", c.file, c.offset)?;
+                match c.kind {
+                    CorruptionKind::BitFlip => write!(f, "one bit flipped"),
+                    CorruptionKind::Misplaced { from, len } => {
+                        write!(f, "overwritten by {len} bytes from byte {from}")
+                    }
+                }
+            }
         }
     }
 }

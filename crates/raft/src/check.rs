@@ -92,12 +92,15 @@ pub struct Checker {
     /// For each committed entry, the term of the node on which the checker first saw it
     /// committed: never earlier than the term it was actually committed in.
     committed_in: Vec<u64>,
+    /// The prefix hash of each committed entry (it and everything before it).
+    committed_hashes: Vec<u64>,
     /// How much of the committed prefix each node's own log has been verified against.
     verified: BTreeMap<NodeId, u64>,
     /// (node, term) pairs whose log was already checked for leader completeness.
     leaders_checked: BTreeSet<(NodeId, u64)>,
-    /// Per node, a hash of each log prefix (entry `i` and everything before it).
-    prefix_hashes: BTreeMap<NodeId, Vec<u64>>,
+    /// Per node: the snapshot index the hashes start after, and the prefix hash of each entry
+    /// after it.
+    prefix_hashes: BTreeMap<NodeId, (u64, Vec<u64>)>,
     /// The prefix hash first seen for each (index, term). Only the leader of a term creates
     /// entries in it and never rewrites them, so an (index, term) pair identifies its whole
     /// prefix, across nodes and across time.
@@ -121,68 +124,118 @@ impl Checker {
         &self.committed
     }
 
+    /// The prefix hash of committed entry `index` (0: the empty prefix), if it is known.
+    fn committed_hash(&self, index: u64) -> Option<u64> {
+        match index {
+            0 => Some(PREFIX_SEED),
+            _ => self.committed_hashes.get(index as usize - 1).copied(),
+        }
+    }
+
+    // A node's snapshot stands in for the entries up to its index: they were committed (a node
+    // only compacts what it applied), so the checker compares the snapshot's last entry with the
+    // committed prefix, and the rest of the log as usual. Nodes compact only entries applied
+    // before the current event, so the checker has always seen them committed first.
     fn check_node(&mut self, raft: &Raft) -> Result<(), Violation> {
         let node = raft.id;
-        let log = &raft.durable.log;
-        let len = log.len() as u64;
-        if raft.commit_index > len {
-            return Err(Violation::CommitBeyondLog { node, commit: raft.commit_index, len });
+        let durable = &raft.durable;
+        let base = durable.snapshot.index;
+        let last = durable.last_index();
+        if raft.commit_index > last {
+            return Err(Violation::CommitBeyondLog { node, commit: raft.commit_index, len: last });
+        }
+        if base > 0
+            && let Some(entry) = self.committed.get(base as usize - 1)
+            && entry.term != durable.snapshot.term
+        {
+            return Err(Violation::CommittedEntryDiffers { node, index: base });
         }
 
         // Log Matching, checked only from the first entry that changed since the last look.
-        if let Some(from) = raft.durable.changed_from.take() {
-            let hashes = self.prefix_hashes.entry(node).or_default();
-            hashes.truncate((from - 1) as usize);
-            hashes.truncate(log.len());
-            let unhashed = hashes.len();
-            for (i, entry) in log.iter().enumerate().skip(unhashed) {
-                let prev = hashes.last().copied().unwrap_or(PREFIX_SEED);
-                let hash = prefix_hash(prev, entry);
-                hashes.push(hash);
-                let (index, term) = (i as u64 + 1, entry.term);
-                match self.entry_prefixes.entry((index, term)) {
-                    MapEntry::Occupied(e) if *e.get() != hash => {
-                        return Err(Violation::LogMatching { node, index, term });
+        if let Some(from) = durable.changed_from.take() {
+            match self.committed_hash(base) {
+                // A snapshot of entries not yet seen committed: look again later.
+                None => durable.changed_from.set(Some(from)),
+                Some(base_hash) => {
+                    let (hashed_base, hashes) = self.prefix_hashes.entry(node).or_default();
+                    if *hashed_base != base {
+                        *hashed_base = base;
+                        hashes.clear();
                     }
-                    MapEntry::Occupied(_) => {}
-                    MapEntry::Vacant(e) => {
-                        e.insert(hash);
+                    hashes.truncate(from.saturating_sub(base + 1) as usize);
+                    hashes.truncate(durable.log.len());
+                    let unhashed = hashes.len();
+                    for (i, entry) in durable.log.iter().enumerate().skip(unhashed) {
+                        let prev = hashes.last().copied().unwrap_or(base_hash);
+                        let hash = prefix_hash(prev, entry);
+                        hashes.push(hash);
+                        let (index, term) = (base + 1 + i as u64, entry.term);
+                        match self.entry_prefixes.entry((index, term)) {
+                            MapEntry::Occupied(e) if *e.get() != hash => {
+                                return Err(Violation::LogMatching { node, index, term });
+                            }
+                            MapEntry::Occupied(_) => {}
+                            MapEntry::Vacant(e) => {
+                                e.insert(hash);
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Entries this node committed must stay in its log, unchanged, even across restarts.
-        // Checking the last verified one is enough: replacing an earlier one means truncating
-        // past it.
-        let verified = self.verified.get(&node).copied().unwrap_or(0);
-        if verified > 0 {
-            let i = (verified - 1) as usize;
-            if log.get(i) != Some(&self.committed[i]) {
-                return Err(Violation::CommittedEntryLost { node, index: verified });
+        // The one exception to the rule below: a node whose disk was damaged may lose entries,
+        // as long as it knows (it is rejoining, and votes for nobody until it has caught up).
+        // Its log can be shorter, or an older log of its own that disagrees with what was
+        // committed since; only the prefix that still agrees counts as verified. Election safety
+        // and leader completeness still hold the cluster to account.
+        if raft.is_rejoining()
+            && let Some(verified) = self.verified.get_mut(&node)
+        {
+            let mut agreed = (*verified).min(last);
+            while agreed > base && durable.entry(agreed) != self.committed.get(agreed as usize - 1)
+            {
+                agreed -= 1;
             }
+            *verified = agreed;
+        }
+        // Entries this node committed must stay in its log (or its snapshot), unchanged, even
+        // across restarts. Checking the last verified one is enough: replacing an earlier one
+        // means truncating past it.
+        let verified = self.verified.get(&node).copied().unwrap_or(0);
+        if verified > base
+            && durable.entry(verified) != Some(&self.committed[verified as usize - 1])
+        {
+            return Err(Violation::CommittedEntryLost { node, index: verified });
         }
 
         // State machine safety: newly committed entries match what others committed there.
-        if raft.commit_index > verified {
-            for index in verified + 1..=raft.commit_index {
-                let i = (index - 1) as usize;
-                match self.committed.get(i) {
-                    Some(entry) if *entry != log[i] => {
-                        return Err(Violation::CommittedEntryDiffers { node, index });
-                    }
-                    Some(_) => {}
-                    None => {
-                        self.committed.push(log[i].clone());
-                        self.committed_in.push(raft.durable.term);
-                    }
+        let mut checked = verified;
+        for index in verified + 1..=raft.commit_index {
+            let i = (index - 1) as usize;
+            match (self.committed.get(i), durable.entry(index)) {
+                (Some(entry), Some(mine)) if entry != mine => {
+                    return Err(Violation::CommittedEntryDiffers { node, index });
                 }
+                // Compacted here: covered by the snapshot check above.
+                (Some(_), _) => {}
+                (None, Some(mine)) => {
+                    let prev = self.committed_hash(index - 1).expect("committed in order");
+                    self.committed.push(mine.clone());
+                    self.committed_in.push(durable.term);
+                    self.committed_hashes.push(prefix_hash(prev, mine));
+                }
+                // Compacted, and never seen committed elsewhere: can't check it yet.
+                (None, None) => break,
             }
-            self.verified.insert(node, raft.commit_index);
+            checked = index;
+        }
+        if checked > verified {
+            self.verified.insert(node, checked);
         }
 
         if raft.role == Role::Leader {
-            let term = raft.durable.term;
+            let term = durable.term;
             match self.leaders.entry(term) {
                 MapEntry::Occupied(e) if *e.get() != node => {
                     return Err(Violation::TwoLeaders { term, first: *e.get(), second: node });
@@ -195,11 +248,12 @@ impl Checker {
             // Leader Completeness only promises that leaders of *later* terms hold a committed
             // entry. A stale leader of an older term (cut off, elected by delayed votes) may
             // legitimately lack entries committed in newer terms; it can never commit anything.
+            // Entries in its snapshot it holds by definition.
             if self.leaders_checked.insert((node, term)) {
                 let committed = self.committed.iter().zip(&self.committed_in);
                 for (i, (entry, &committed_in)) in committed.enumerate() {
-                    if committed_in < term && log.get(i) != Some(entry) {
-                        let index = i as u64 + 1;
+                    let index = i as u64 + 1;
+                    if committed_in < term && index > base && durable.entry(index) != Some(entry) {
                         return Err(Violation::LeaderMissingCommitted { node, term, index });
                     }
                 }

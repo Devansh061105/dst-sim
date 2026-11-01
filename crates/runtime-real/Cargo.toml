@@ -1,0 +1,12 @@
+[package]
+name = "runtime-real"
+description = "Real-mode runtime: runs the same node code as the simulator, over TCP and real files."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sim-api = { workspace = true }
+
+[lints]
+workspace = true

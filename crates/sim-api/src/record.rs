@@ -33,22 +33,22 @@ pub fn encode(payload: &[u8]) -> Vec<u8> {
 pub fn decode(bytes: &[u8]) -> Decoded {
     let mut records = Vec::new();
     let mut pos = 0;
-    while bytes.len() - pos >= HEADER {
-        let crc = u32::from_le_bytes(bytes[pos..pos + 4].try_into().expect("4 bytes"));
-        let len_bytes: [u8; 4] = bytes[pos + 4..pos + HEADER].try_into().expect("4 bytes");
-        let start = pos + HEADER;
-        let Some(end) = start.checked_add(u32::from_le_bytes(len_bytes) as usize) else { break };
-        if end > bytes.len() {
-            break;
-        }
-        let payload = &bytes[start..end];
-        if checksum(&len_bytes, payload) != crc {
-            break;
-        }
+    while let Some((payload, end)) = record_at(bytes, pos) {
         records.push(payload.to_vec());
         pos = end;
     }
     Decoded { records, valid_len: pos as u64 }
+}
+
+/// The payload of a valid record starting at `pos`, and where the record ends.
+fn record_at(bytes: &[u8], pos: usize) -> Option<(&[u8], usize)> {
+    let header = bytes.get(pos..pos.checked_add(HEADER)?)?;
+    let crc = u32::from_le_bytes(header[..4].try_into().expect("4 bytes"));
+    let len_bytes: [u8; 4] = header[4..].try_into().expect("4 bytes");
+    let start = pos + HEADER;
+    let end = start.checked_add(u32::from_le_bytes(len_bytes) as usize)?;
+    let payload = bytes.get(start..end)?;
+    (checksum(&len_bytes, payload) == crc).then_some((payload, end))
 }
 
 fn checksum(len_bytes: &[u8], payload: &[u8]) -> u32 {

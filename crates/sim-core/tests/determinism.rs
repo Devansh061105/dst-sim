@@ -40,7 +40,7 @@ fn same_seed_same_run() {
         let (a, sim_a) = gossip(seed, 5, true);
         let (b, sim_b) = gossip(seed, 5, true);
         assert_eq!(a, b, "seed {seed}");
-        assert_eq!(sim_a.trace().lines(), sim_b.trace().lines(), "seed {seed}");
+        assert_eq!(sim_a.trace().events(), sim_b.trace().events(), "seed {seed}");
     }
 }
 
@@ -57,9 +57,36 @@ fn same_seed_same_run_under_chaos() {
             let config = SimConfig { keep_trace_lines: true, ..SimConfig::chaos(seed, 5) };
             let mut sim = Simulation::new(config, |_| Gossip::default());
             let summary = sim.run();
-            (summary, sim.trace().lines().map(<[String]>::to_vec))
+            (summary, sim.trace().events().map(<[_]>::to_vec))
         };
         assert_eq!(run(), run(), "seed {seed}");
+    }
+}
+
+/// The recorded fault schedule, replayed in place of the random nemesis, gives the very same run:
+/// this is what lets a failing run be shrunk by editing its schedule.
+#[test]
+fn replaying_the_recorded_schedule_reproduces_the_run() {
+    for seed in 0..100 {
+        let config = SimConfig::chaos(seed, 5);
+        let mut original = Simulation::new(config.clone(), |_| Gossip::default());
+        let summary = original.run();
+        let script = original.script();
+        assert!(!script.faults.is_empty(), "seed {seed}: no faults recorded");
+
+        let mut replay_config = config.clone();
+        replay_config.faults.script = Some(script.clone());
+        let mut replay = Simulation::new(replay_config, |_| Gossip::default());
+        assert_eq!(replay.run().trace_hash, summary.trace_hash, "seed {seed}");
+        assert_eq!(replay.script(), script, "seed {seed}");
+
+        // Any subset of the schedule is still a valid schedule.
+        let mut thinned = config;
+        thinned.faults.script = Some(sim_core::Script {
+            faults: script.faults.iter().step_by(2).cloned().collect(),
+            ..script
+        });
+        Simulation::new(thinned, |_| Gossip::default()).run();
     }
 }
 

@@ -18,3 +18,7 @@ Thumbs.db
 
 # Failing-seed reports written by `dst sweep`
 failures*.txt
+
+# Scenario files written by `dst shrink`, and data directories of a local real cluster
+shrunk*.txt
+/data/

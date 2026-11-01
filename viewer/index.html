@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dst trace viewer</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1f; --muted: #6b6b70; --line: #dcdcd8;
+    --lane: #efefec; --down: #d4d4cf; --vote: #8a4fd1; --append: #2f6fd6; --heartbeat: #9db5dc;
+    --result: #2a9d8f; --client: #d98a00; --drop: #d62828; --fault: #d62828; --restart: #2e8b57;
+    --halt: #c2410c; --disk: #8d6e63; --partition: #f4a26133; --partition-ink: #b5651d;
+    --op: #2e8b5733; --op-ink: #2e8b57; --bad: #d62828; --timer: #a0a0a0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #151517; --panel: #1e1e21; --ink: #ececec; --muted: #9a9aa0; --line: #34343a;
+      --lane: #232327; --down: #3a3a40; --vote: #b388ff; --append: #6ea8ff; --heartbeat: #3d557a;
+      --result: #4fd1c5; --client: #ffb454; --drop: #ff6b6b; --fault: #ff6b6b; --restart: #6fcf97;
+      --halt: #ff8a5b; --disk: #bcaaa4; --partition: #f4a26126; --partition-ink: #f4a261;
+      --op: #6fcf9733; --op-ink: #6fcf97; --bad: #ff6b6b; --timer: #707078;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { padding: 14px 18px 10px; display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: baseline; }
+  h1 { font-size: 17px; margin: 0; font-weight: 650; }
+  .badge { padding: 2px 9px; border-radius: 999px; font-size: 12.5px; font-weight: 600; }
+  .pass { background: color-mix(in srgb, var(--restart) 18%, transparent); color: var(--restart); }
+  .fail { background: color-mix(in srgb, var(--bad) 16%, transparent); color: var(--bad); }
+  .muted { color: var(--muted); font-size: 13px; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; padding: 0 18px 10px; font-size: 13px; }
+  .toolbar label { display: inline-flex; gap: 5px; align-items: center; cursor: pointer; user-select: none; }
+  .legend { display: inline-flex; gap: 5px; align-items: center; color: var(--muted); margin-left: -10px; }
+  .legend .swatch:not(:first-child) { margin-left: 6px; }
+  .swatch { width: 14px; height: 3px; border-radius: 2px; display: inline-block; }
+  button, .file { font: inherit; font-size: 13px; padding: 3px 10px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--ink); cursor: pointer; }
+  button:hover, .file:hover { border-color: var(--muted); }
+  #wrap { position: relative; margin: 0 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  canvas { display: block; width: 100%; cursor: grab; touch-action: none; }
+  canvas.dragging { cursor: grabbing; }
+  #tip { position: absolute; pointer-events: none; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 7px 9px; font: 12px/1.4 ui-monospace, "Cascadia Mono", Consolas, monospace;
+    max-width: min(560px, 90%); white-space: pre-wrap; word-break: break-word; box-shadow: 0 4px 16px #0002; display: none; }
+  #log { margin: 12px 18px 24px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+    max-height: 300px; overflow: auto; font: 12px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  #log div { padding: 1px 10px; white-space: nowrap; cursor: pointer; }
+  #log div:hover { background: var(--lane); }
+  #log .t { color: var(--muted); margin-right: 8px; }
+  #log .hl { background: color-mix(in srgb, var(--append) 14%, transparent); }
+  #empty { margin: 60px auto; max-width: 520px; text-align: center; color: var(--muted); }
+  code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12.5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">dst trace viewer</h1>
+  <span id="verdict"></span>
+  <span id="summary" class="muted"></span>
+</header>
+<div class="toolbar" id="toolbar" hidden>
+  <label><input type="checkbox" id="f-msg" checked>messages:</label>
+  <span class="legend"><span class="swatch" style="background:var(--vote)"></span>vote <span class="swatch" style="background:var(--append)"></span>append <span class="swatch" style="background:var(--result)"></span>ack <span class="swatch" style="background:var(--client)"></span>client</span>
+  <label><input type="checkbox" id="f-hb"><span class="swatch" style="background:var(--heartbeat)"></span>heartbeats</label>
+  <label><input type="checkbox" id="f-drop" checked><span class="swatch" style="background:var(--drop)"></span>dropped</label>
+  <label><input type="checkbox" id="f-timer"><span class="swatch" style="background:var(--timer)"></span>timers</label>
+  <label><input type="checkbox" id="f-ops" checked><span class="swatch" style="background:var(--op-ink)"></span>client ops</label>
+  <button id="fit">Fit</button>
+  <button id="to-end">Zoom to end</button>
+  <span class="muted">scroll to zoom · drag to pan · click an event to list what happened around it</span>
+</div>
+<div id="wrap" hidden><canvas id="c"></canvas><div id="tip"></div></div>
+<div id="log" hidden></div>
+<div id="empty" hidden>
+  <p>No trace is built into this page. Write one with</p>
+  <p><code>dst run --seed 42 --mode chaos --html run.html</code></p>
+  <p>or load a JSON trace from <code>dst run ... --json run.json</code>:</p>
+  <label class="file">Open JSON…<input type="file" id="file" accept=".json,application/json" hidden></label>
+</div>
+<script>
+const DATA = /*TRACE_DATA*/null;
+
+const $ = (id) => document.getElementById(id);
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+function fmtTime(ns) {
+  const s = ns / 1e9;
+  if (s >= 1) return s.toFixed(s >= 10 ? 2 : 3) + " s";
+  const ms = ns / 1e6;
+  if (ms >= 1) return ms.toFixed(ms >= 100 ? 0 : 1) + " ms";
+  return (ns / 1e3).toFixed(0) + " µs";
+}
+
+function messageType(text) {
+  // "n1 <- n0 Raft(AppendEntries { ... })" -> "AppendEntries"; client traffic -> Request/Response.
+  const m = text.match(/<-x?-? n\d+ (?:\w+ )?(?:Raft\()?(\w+)/);
+  return m ? m[1] : "?";
+}
+
+function load(data) {
+  $("empty").hidden = true;
+  for (const id of ["toolbar", "wrap"]) $(id).hidden = false;
+  document.title = data.title + " · dst trace viewer";
+  $("title").textContent = data.title;
+  $("verdict").className = "badge " + (data.failure ? "fail" : "pass");
+  $("verdict").textContent = data.failure ? "FAIL: " + data.failure : "PASS";
+  $("summary").textContent = data.summary;
+  new Viewer(data);
+}
+
+class Viewer {
+  constructor(data) {
+    this.data = data;
+    this.canvas = $("c");
+    this.ctx = this.canvas.getContext("2d");
+    this.laneH = 46;
+    this.left = 74;
+    this.right = 96;
+    this.top = 46;
+    this.end = Math.max(data.end, 1);
+    this.prepare();
+    this.fit();
+    this.bind();
+    this.resize();
+  }
+
+  prepare() {
+    const d = this.data;
+    this.lanes = d.nodes.map((n) => n.id);
+    // Down periods per node, from crashes and halts to the next start.
+    this.down = new Map(this.lanes.map((id) => [id, []]));
+    const downSince = new Map();
+    this.partitions = [];
+    let partition = null;
+    this.markers = [];
+    this.messages = [];
+    this.timers = [];
+    for (const [i, e] of d.events.entries()) {
+      e.i = i;
+      if (e.k === "deliver" || e.k === "drop") {
+        e.type = messageType(e.text);
+        e.heartbeat = e.type === "AppendEntries" && /entries: \[\]/.test(e.text);
+        this.messages.push(e);
+      } else if (e.k === "timer") {
+        this.timers.push(e);
+      } else if (e.k === "fault") {
+        if (e.fault === "crash") { downSince.set(e.nodes[0], e.t); this.markers.push({ e, node: e.nodes[0], kind: "crash" }); }
+        else if (e.fault === "restart") this.markers.push({ e, node: e.nodes[0], kind: "restart" });
+        else {
+          if (partition) { partition.to = e.t; this.partitions.push(partition); partition = null; }
+          if (e.fault !== "heal") partition = { from: e.t, to: null, text: e.text.replace(/^fault /, "") };
+        }
+      } else if (e.k === "halt") {
+        downSince.set(e.node, e.t);
+        this.markers.push({ e, node: e.node, kind: "halt" });
+      } else if (e.k === "start") {
+        if (downSince.has(e.node)) { this.down.get(e.node).push([downSince.get(e.node), e.t]); downSince.delete(e.node); }
+      } else if (e.k === "disk" || e.k === "sync" || e.k === "corrupt") {
+        this.markers.push({ e, node: e.node, kind: e.k });
+      }
+    }
+    for (const [node, since] of downSince) this.down.get(node).push([since, null]);
+    if (partition) this.partitions.push(partition);
+  }
+
+  // View: time t0 at the left edge, `scale` pixels per nanosecond.
+  fit() { this.t0 = 0; this.scale = (this.width() - this.left - this.right) / this.end; }
+  width() { return this.canvas.clientWidth || 1000; }
+  x(t) { return this.left + (t - this.t0) * this.scale; }
+  t(x) { return this.t0 + (x - this.left) / this.scale; }
+  y(node) { return this.top + this.lanes.indexOf(node) * this.laneH + this.laneH / 2; }
+
+  bind() {
+    const filters = ["f-msg", "f-hb", "f-drop", "f-timer", "f-ops"];
+    for (const f of filters) $(f).addEventListener("change", () => this.draw());
+    $("fit").onclick = () => { this.fit(); this.draw(); };
+    $("to-end").onclick = () => {
+      const span = Math.min(this.end, 200e6);
+      this.scale = (this.width() - this.left - this.right) / span;
+      this.t0 = this.end - span * 0.9;
+      this.draw();
+    };
+    window.addEventListener("resize", () => this.resize());
+    const c = this.canvas;
+    c.addEventListener("wheel", (ev) => {
+      ev.preventDefault();
+      const t = this.t(ev.offsetX);
+      const factor = Math.exp(-ev.deltaY * 0.0015);
+      const minScale = (this.width() - this.left - this.right) / this.end / 2;
+      this.scale = Math.min(Math.max(this.scale * factor, minScale), 2e-2);
+      this.t0 = t - (ev.offsetX - this.left) / this.scale;
+      this.draw();
+    }, { passive: false });
+    let drag = null;
+    c.addEventListener("pointerdown", (ev) => { drag = { x: ev.offsetX, t0: this.t0, moved: false }; c.setPointerCapture(ev.pointerId); });
+    c.addEventListener("pointermove", (ev) => {
+      if (drag) {
+        if (Math.abs(ev.offsetX - drag.x) > 3) { drag.moved = true; c.classList.add("dragging"); }
+        this.t0 = drag.t0 - (ev.offsetX - drag.x) / this.scale;
+        this.draw();
+        $("tip").style.display = "none";
+      } else this.hover(ev.offsetX, ev.offsetY);
+    });
+    c.addEventListener("pointerup", (ev) => {
+      c.classList.remove("dragging");
+      if (drag && !drag.moved) { const hit = this.hit(ev.offsetX, ev.offsetY); this.showLog(hit ? hit.e.t : this.t(ev.offsetX), hit); }
+      drag = null;
+    });
+    c.addEventListener("pointerleave", () => { $("tip").style.display = "none"; });
+  }
+
+  resize() {
+    const dpr = window.devicePixelRatio || 1;
+    const h = this.top + this.lanes.length * this.laneH + 30;
+    const oldWidth = this.cssWidth || this.width();
+    this.canvas.style.height = h + "px";
+    this.canvas.width = Math.round(this.width() * dpr);
+    this.canvas.height = Math.round(h * dpr);
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (this.cssWidth) this.scale *= (this.width() - this.left - this.right) / (oldWidth - this.left - this.right);
+    this.cssWidth = this.width();
+    this.draw();
+  }
+
+  visible(t) { return t >= this.t(this.left) - 1 && t <= this.t(this.width()) + 1; }
+
+  draw() {
+    const ctx = this.ctx, W = this.width(), H = this.top + this.lanes.length * this.laneH + 30;
+    const on = (id) => $(id).checked;
+    this.hits = [];
+    ctx.clearRect(0, 0, W, H);
+    ctx.font = "12px system-ui, sans-serif";
+    ctx.textBaseline = "middle";
+    const tl = this.t(this.left), tr = this.t(W);
+
+    // Lanes and down periods.
+    for (const [i, node] of this.lanes.entries()) {
+      const y0 = this.top + i * this.laneH;
+      ctx.fillStyle = i % 2 ? css("--panel") : css("--lane");
+      ctx.fillRect(this.left, y0, W - this.left, this.laneH);
+      for (const [from, to] of this.down.get(node)) {
+        const x0 = Math.max(this.x(from), this.left), x1 = Math.min(this.x(to === null ? this.end : to), W);
+        if (x1 <= x0) continue;
+        ctx.fillStyle = css("--down");
+        ctx.fillRect(x0, y0 + 6, x1 - x0, this.laneH - 12);
+        if (x1 - x0 > 50) { ctx.fillStyle = css("--muted"); ctx.fillText("down", x0 + 6, y0 + this.laneH / 2); }
+      }
+    }
+
+    // Partitions, as a band above the lanes.
+    for (const p of this.partitions) {
+      const x0 = Math.max(this.x(p.from), this.left), x1 = Math.min(this.x(p.to === null ? this.end : p.to), W);
+      if (x1 <= x0) continue;
+      ctx.fillStyle = css("--partition");
+      ctx.fillRect(x0, this.top - 18, x1 - x0, this.lanes.length * this.laneH + 18);
+      ctx.fillStyle = css("--partition-ink");
+      ctx.save(); ctx.beginPath(); ctx.rect(x0, this.top - 18, x1 - x0, 18); ctx.clip();
+      ctx.fillText(p.text, x0 + 4, this.top - 9);
+      ctx.restore();
+      this.hits.push({ kind: "band", x0, x1, y0: this.top - 18, y1: this.top, e: { t: p.from, text: "partition: " + p.text } });
+    }
+
+    // Time axis.
+    ctx.fillStyle = css("--muted");
+    ctx.strokeStyle = css("--line");
+    const step = niceStep((tr - tl) / Math.max(W / 120, 1));
+    ctx.textAlign = "center";
+    for (let t = Math.ceil(tl / step) * step; t <= tr; t += step) {
+      const x = this.x(t);
+      if (x < this.left + 12) continue; // keep labels clear of the lane names
+      ctx.beginPath(); ctx.moveTo(x, this.top); ctx.lineTo(x, H - 26); ctx.stroke();
+      ctx.fillText(t === 0 ? "0" : fmtTime(t), x, H - 13);
+    }
+    ctx.textAlign = "left";
+
+    // Client operations, as bars on the client lanes.
+    if (on("f-ops")) {
+      for (const op of this.data.ops) {
+        const end = op.end === null ? this.end : op.end;
+        if (end < tl || op.start > tr) continue;
+        // Inset by a pixel so back-to-back operations stay visibly separate.
+        const y = this.y(op.client), x0 = Math.max(this.x(op.start) + 1, this.left), x1 = Math.max(Math.min(this.x(end) - 1, W), x0 + 2);
+        ctx.fillStyle = css("--op");
+        ctx.fillRect(x0, y - 9, x1 - x0, 18);
+        ctx.strokeStyle = op.bad ? css("--bad") : css("--op-ink");
+        ctx.lineWidth = op.bad ? 2 : 1;
+        ctx.setLineDash(op.end === null ? [4, 3] : []);
+        ctx.strokeRect(x0, y - 9, x1 - x0, 18);
+        ctx.setLineDash([]); ctx.lineWidth = 1;
+        if (x1 - x0 > 60) {
+          ctx.save(); ctx.beginPath(); ctx.rect(x0, y - 9, x1 - x0, 18); ctx.clip();
+          ctx.fillStyle = op.bad ? css("--bad") : css("--ink");
+          ctx.fillText(op.text, x0 + 4, y);
+          ctx.restore();
+        }
+        const text = op.text + (op.bad ? "\n(on the key whose history is not linearizable)" : "");
+        this.hits.push({ kind: "band", x0, x1, y0: y - 9, y1: y + 9, e: { t: op.start, text: `n${op.client} ${text}\n${fmtTime(op.start)} → ${op.end === null ? "never answered" : fmtTime(op.end)}` } });
+      }
+    }
+
+    // Timers, as small ticks.
+    if (on("f-timer")) {
+      ctx.strokeStyle = css("--timer");
+      for (const e of this.timers) {
+        if (!this.visible(e.t)) continue;
+        const x = this.x(e.t), y = this.y(e.node);
+        ctx.beginPath(); ctx.moveTo(x, y - this.laneH / 2 + 4); ctx.lineTo(x, y - this.laneH / 2 + 12); ctx.stroke();
+        this.hits.push({ kind: "point", x, y: y - this.laneH / 2 + 8, e });
+      }
+    }
+
+    // Messages: an arrow from (sender, send time) to (receiver, arrival time).
+    for (const e of this.messages) {
+      const drop = e.k === "drop";
+      if (drop ? !on("f-drop") : !on("f-msg")) continue;
+      if (e.heartbeat && !on("f-hb")) continue;
+      if (Math.max(e.t, e.sent) < tl || Math.min(e.t, e.sent) > tr) continue;
+      const x0 = this.x(e.sent), y0 = this.y(e.from), y1 = this.y(e.to);
+      // A message lost in the network never arrives: draw a stub that stops short.
+      const lostInNet = drop && e.reason !== "node down";
+      const x1 = lostInNet ? x0 + 14 : this.x(e.t);
+      const yEnd = lostInNet ? y0 + (y1 - y0) * 0.35 : y1;
+      ctx.strokeStyle = drop ? css("--drop") : color(e);
+      ctx.fillStyle = ctx.strokeStyle;
+      ctx.globalAlpha = e.heartbeat ? 0.55 : 0.9;
+      ctx.setLineDash(drop ? [3, 3] : []);
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, yEnd); ctx.stroke();
+      ctx.setLineDash([]);
+      if (drop) cross(ctx, x1, yEnd); else arrowHead(ctx, x0, y0, x1, yEnd);
+      ctx.globalAlpha = 1;
+      this.hits.push({ kind: "segment", x0, y0, x1, y1: yEnd, e });
+    }
+
+    // Faults on nodes.
+    for (const m of this.markers) {
+      if (!this.visible(m.e.t)) continue;
+      const x = this.x(m.e.t), y = this.y(m.node);
+      // Crashes and halts are labelled above the lane's centre, restarts below; disk events are
+      // a small square (hover for what the disk lost).
+      const style = { crash: ["--fault", "✕ crash", -14], halt: ["--halt", "✕ halt", -14], restart: ["--restart", "▶ restart", 14], disk: ["--disk", null, 0], sync: ["--halt", null, 0], corrupt: ["--bad", "⚡ disk damaged", 14] }[m.kind];
+      ctx.fillStyle = css(style[0]);
+      if (style[1]) {
+        ctx.font = "600 12px system-ui, sans-serif";
+        ctx.fillText(style[1], x + 3, y + style[2]);
+        ctx.fillRect(x - 1, y - this.laneH / 2 + 3, 2, this.laneH - 6);
+        ctx.font = "12px system-ui, sans-serif";
+      } else {
+        ctx.fillRect(x - 4, y - 4, 8, 8);
+      }
+      this.hits.push({ kind: "point", x: style[1] ? x + 12 : x, y: y + style[2], e: m.e });
+    }
+
+    // The failure, at the moment the run stopped.
+    if (this.data.failure) {
+      const x = this.x(this.end);
+      if (x >= this.left && x <= W) {
+        ctx.strokeStyle = css("--bad"); ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(x, this.top - 18); ctx.lineTo(x, H - 26); ctx.stroke(); ctx.lineWidth = 1;
+        ctx.fillStyle = css("--bad"); ctx.font = "600 12px system-ui, sans-serif"; ctx.textAlign = "right";
+        ctx.fillText("failure", x - 4, this.top - 30); ctx.textAlign = "left"; ctx.font = "12px system-ui, sans-serif";
+      }
+    }
+
+    // Lane labels last, over anything that scrolled under them.
+    ctx.fillStyle = css("--panel");
+    ctx.fillRect(0, 0, this.left, H);
+    for (const [i, n] of this.data.nodes.entries()) {
+      const y = this.top + i * this.laneH + this.laneH / 2;
+      ctx.fillStyle = css("--ink"); ctx.font = "600 13px system-ui, sans-serif";
+      ctx.fillText("n" + n.id, 12, y - 7);
+      ctx.fillStyle = css("--muted"); ctx.font = "11px system-ui, sans-serif";
+      ctx.fillText(n.role, 12, y + 8);
+    }
+    ctx.font = "12px system-ui, sans-serif";
+  }
+
+  hit(px, py) {
+    let best = null, bestD = 7;
+    for (const h of this.hits) {
+      let d;
+      if (h.kind === "segment") d = segmentDistance(px, py, h.x0, h.y0, h.x1, h.y1);
+      else if (h.kind === "point") d = Math.hypot(px - h.x, py - h.y) - 3;
+      else d = px >= h.x0 && px <= h.x1 && py >= h.y0 && py <= h.y1 ? 6.5 : Infinity;
+      if (d < bestD) { bestD = d; best = h; }
+    }
+    return best;
+  }
+
+  hover(px, py) {
+    const tip = $("tip"), h = this.hit(px, py);
+    if (!h) { tip.style.display = "none"; return; }
+    const e = h.e;
+    let text = `${fmtTime(e.t)}  ${e.text}`;
+    if (e.k === "deliver") text += `\nsent ${fmtTime(e.sent)}, in flight ${fmtTime(e.t - e.sent)}`;
+    if (e.k === "drop") text += `\nsent ${fmtTime(e.sent)}, dropped: ${e.reason}`;
+    tip.textContent = text;
+    tip.style.display = "block";
+    const wrap = $("wrap").getBoundingClientRect();
+    const left = Math.min(px + 14, wrap.width - tip.offsetWidth - 8);
+    tip.style.left = Math.max(left, 8) + "px";
+    tip.style.top = (py + 16) + "px";
+  }
+
+  // Lists the events around time `t` below the diagram.
+  showLog(t, hit) {
+    const events = this.data.events;
+    let lo = 0, hi = events.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (events[mid].t < t) lo = mid + 1; else hi = mid; }
+    const center = hit && hit.e.i !== undefined ? hit.e.i : lo;
+    const from = Math.max(0, center - 40), to = Math.min(events.length, center + 60);
+    const log = $("log");
+    log.hidden = false;
+    log.replaceChildren();
+    for (let i = from; i < to; i++) {
+      const e = events[i], row = document.createElement("div");
+      if (i === center) row.className = "hl";
+      const time = document.createElement("span");
+      time.className = "t"; time.textContent = fmtTime(e.t);
+      row.append(time, e.text);
+      row.onclick = () => { const span = (this.width() - this.left) / this.scale; this.t0 = e.t - span / 2; this.draw(); };
+      log.append(row);
+    }
+    const highlighted = log.querySelector(".hl");
+    if (highlighted) highlighted.scrollIntoView({ block: "center" });
+  }
+}
+
+function color(e) {
+  if (e.type === "RequestVote" || e.type === "Vote") return css("--vote");
+  if (e.type === "AppendEntries" || e.type === "InstallSnapshot") return e.heartbeat ? css("--heartbeat") : css("--append");
+  if (e.type === "AppendResult") return css("--result");
+  return css("--client");
+}
+
+function arrowHead(ctx, x0, y0, x1, y1) {
+  const a = Math.atan2(y1 - y0, x1 - x0), s = 6;
+  ctx.beginPath();
+  ctx.moveTo(x1, y1);
+  ctx.lineTo(x1 - s * Math.cos(a - 0.4), y1 - s * Math.sin(a - 0.4));
+  ctx.lineTo(x1 - s * Math.cos(a + 0.4), y1 - s * Math.sin(a + 0.4));
+  ctx.closePath(); ctx.fill();
+}
+
+function cross(ctx, x, y) {
+  const s = 4;
+  ctx.beginPath(); ctx.moveTo(x - s, y - s); ctx.lineTo(x + s, y + s); ctx.moveTo(x + s, y - s); ctx.lineTo(x - s, y + s); ctx.stroke();
+}
+
+function segmentDistance(px, py, x0, y0, x1, y1) {
+  const dx = x1 - x0, dy = y1 - y0, len = dx * dx + dy * dy;
+  const u = len ? Math.max(0, Math.min(1, ((px - x0) * dx + (py - y0) * dy) / len)) : 0;
+  return Math.hypot(px - (x0 + u * dx), py - (y0 + u * dy));
+}
+
+function niceStep(raw) {
+  const p = Math.pow(10, Math.floor(Math.log10(Math.max(raw, 1))));
+  for (const m of [1, 2, 5, 10]) if (raw <= m * p) return m * p;
+  return 10 * p;
+}
+
+if (DATA) load(DATA);
+else {
+  $("empty").hidden = false;
+  $("file").addEventListener("change", async (ev) => {
+    const file = ev.target.files[0];
+    if (file) load(JSON.parse(await file.text()));
+  });
+}
+</script>
+</body>
+</html>

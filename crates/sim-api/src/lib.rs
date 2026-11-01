@@ -9,6 +9,7 @@ pub mod record;
 mod storage;
 mod sub_context;
 mod time;
+pub mod wire;
 
 use std::fmt;
 use std::hash::Hash;
