@@ -24,16 +24,8 @@ jobs:
         run: |
           cargo flamegraph --release -p dst-cli --bin dst -o flamegraph.svg -- \
             sweep --seeds 0..2000 --mode chaos --jobs 1
-      - name: Top functions
-        run: |
-          perf report --stdio --no-children --sort symbol --percent-limit 0.5 > self.txt
-          perf report --stdio --children --sort symbol --percent-limit 2 -g none > total.txt
-          head -60 self.txt
-          head -60 total.txt
+      # Every frame's share of samples is in the SVG's tooltips.
       - uses: actions/upload-artifact@v4
         with:
-          name: profile
-          path: |
-            flamegraph.svg
-            self.txt
-            total.txt
+          name: flamegraph
+          path: flamegraph.svg
