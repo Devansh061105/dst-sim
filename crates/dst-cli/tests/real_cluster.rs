@@ -46,41 +46,59 @@ impl Drop for Cluster {
     }
 }
 
-#[test]
-fn killed_servers_recover_and_clients_see_a_linearizable_history() {
-    let ports = free_ports(4);
-    let nodes = ports.iter().map(|p| format!("127.0.0.1:{p}")).collect::<Vec<_>>().join(",");
-    let data = std::env::temp_dir().join(format!("dst-real-cluster-{}", std::process::id()));
-    let mut cluster = Cluster { servers: (0..3).map(|i| serve(i, &nodes, &data)).collect(), data };
+/// Kills that must land while a client is running. Each client does a fixed amount of work, and
+/// how long that takes varies a lot between machines (Linux finishes in well under a second, a
+/// Windows CI runner takes tens of seconds), so clients are started one after another until
+/// enough kills have hit a running one. Each client gets a fresh cluster: the checker assumes
+/// every key starts out absent, so a client must see the store from its very first write.
+const KILLS: u32 = 3;
 
-    let mut client = Command::new(DST)
-        .args(["client", "--id", "3", "--nodes", &nodes, "--ops", "200", "--timeout", "90"])
+fn client(nodes: &str) -> Child {
+    Command::new(DST)
+        .args(["client", "--id", "3", "--nodes", nodes, "--ops", "200", "--timeout", "90"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start the client");
+        .expect("start the client")
+}
 
-    // Kill each server in turn mid-run (one at a time, so a majority stays up) and restart it on
-    // its data directory: what it acknowledged must still be there.
+#[test]
+fn killed_servers_recover_and_clients_see_a_linearizable_history() {
     let started = Instant::now();
-    let mut kills = 0;
-    while client.try_wait().expect("poll the client").is_none() {
-        assert!(started.elapsed() < Duration::from_secs(120), "the client never finished");
-        sleep(Duration::from_millis(400));
-        let victim = kills % 3;
-        let server = &mut cluster.servers[victim];
-        server.kill().expect("kill a server");
-        server.wait().expect("reap it");
-        kills += 1;
-        sleep(Duration::from_millis(150));
-        cluster.servers[victim] = serve(victim, &nodes, &cluster.data);
-    }
+    let (mut kills, mut clients) = (0, 0);
+    while kills < KILLS {
+        clients += 1;
+        let ports = free_ports(4);
+        let nodes = ports.iter().map(|p| format!("127.0.0.1:{p}")).collect::<Vec<_>>().join(",");
+        let data =
+            std::env::temp_dir().join(format!("dst-real-cluster-{}-{clients}", std::process::id()));
+        let mut cluster =
+            Cluster { servers: (0..3).map(|i| serve(i, &nodes, &data)).collect(), data };
+        let mut running = client(&nodes);
 
-    let output = client.wait_with_output().expect("client output");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stdout}\n{stderr}");
-    assert!(stdout.contains("PASS"), "{stdout}");
-    assert!(kills >= 2, "only {kills} kills: the run was too short to test recovery");
-    println!("{stdout}servers killed and restarted: {kills}");
+        // Kill each server in turn mid-run (one at a time, so a majority stays up) and restart
+        // it on its data directory: what it acknowledged must still be there.
+        loop {
+            assert!(started.elapsed() < Duration::from_secs(180), "the clients never finished");
+            sleep(Duration::from_millis(400));
+            if running.try_wait().expect("poll the client").is_some() {
+                break;
+            }
+            let victim = (kills % 3) as usize;
+            let server = &mut cluster.servers[victim];
+            server.kill().expect("kill a server");
+            server.wait().expect("reap it");
+            kills += 1;
+            sleep(Duration::from_millis(150));
+            cluster.servers[victim] = serve(victim, &nodes, &cluster.data);
+        }
+        // Every client, including one that saw no kill, must see a linearizable history.
+        let output = running.wait_with_output().expect("client output");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("PASS"), "{stdout}");
+        println!("client {clients}: {stdout}");
+    }
+    println!("{clients} clients, servers killed and restarted while one ran: {kills}");
 }
