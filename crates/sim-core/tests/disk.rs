@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use sim_api::NodeId;
+use sim_api::{NodeId, Time};
 use sim_core::toys::{Ledger, LedgerMode};
 use sim_core::{DiskConfig, Fault, SimConfig, Simulation, Stats};
 
@@ -111,4 +111,22 @@ fn disk_faults_replay_identically() {
         let b = crash_cycles(LedgerMode::NoSync, harsh_disk(), seed, 5);
         assert_eq!((a.trace_hash, a.stats), (b.trace_hash, b.stats), "seed {seed}");
     }
+}
+
+/// Disk faults end with the calm period even when no nemesis runs (no partitions, no crashes):
+/// otherwise a swarm mix of disk faults alone would fail syncs forever, and a correct system
+/// could never be shown to finish.
+#[test]
+fn disk_faults_stop_at_the_calm_period_without_a_nemesis() {
+    let disk = DiskConfig { sync_fail: 0.2, ..DiskConfig::default() };
+    let config = SimConfig { disk, ..SimConfig::new(7, 1) };
+    let calm_at = config.faults.active_for;
+    assert!(!config.faults.enabled(), "no nemesis in this configuration");
+    // RetrySync keeps writing and syncing whatever happens, so it would see any later failure.
+    let mut sim = Simulation::new(config, |_| Ledger::new(LedgerMode::RetrySync));
+    sim.run_until(Time::ZERO + calm_at);
+    let during = sim.stats().sync_failures;
+    sim.run_until(Time::ZERO + calm_at * 3);
+    assert!(during > 0, "the disk failed syncs during the fault period");
+    assert_eq!(sim.stats().sync_failures, during, "no sync fails after the calm period");
 }

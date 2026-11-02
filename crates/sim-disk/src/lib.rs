@@ -32,6 +32,13 @@ pub struct DiskConfig {
     pub corrupt: f64,
 }
 
+impl DiskConfig {
+    /// Whether this disk fails on its own (the faults [`Disk::calm`] switches off).
+    pub fn has_faults(&self) -> bool {
+        self.sync_fail > 0.0 || self.crash_during_sync > 0.0 || self.corrupt > 0.0
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Op {
     Write { offset: u64, data: Vec<u8> },

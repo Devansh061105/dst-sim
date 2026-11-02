@@ -308,6 +308,10 @@ impl<N: Node> Simulation<N> {
         } else if config.faults.enabled() {
             let first = fault_rng.duration_in(config.faults.interval.clone());
             queue.push(Time::ZERO + first, Event::Nemesis);
+        } else if config.disk.has_faults() {
+            // No nemesis, but the disks fail on their own: the calm period must still come, or
+            // they fail forever and no system can promise to finish.
+            queue.push(faults_end, Event::Nemesis);
         }
 
         Simulation {
