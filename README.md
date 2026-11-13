@@ -117,6 +117,14 @@ servers):
 | A change starts before the previous one has committed | 270 | 833 | Raft invariants |
 | A new leader changes the configuration before committing in its own term (the 2015 bug) | not yet | not yet | Raft invariants, targeted scenario |
 
+*Leader leases* (`crates/harness/tests/leases.rs`): a second check runs after every step, that
+while a leader holds a lease (by its own clock) a majority of its configuration would refuse to
+vote, so it catches an unsafe lease whether or not a rival election happens to win the race. A
+lease that ignores drift is caught in 12 of 1,000 chaos seeds at random (clocks drift up to 5%),
+and in 14 of 20 seeds of a targeted scenario that steers leadership to the slowest clock and cuts
+it off as its lease renews. Correct leases pass every one: 1,000 chaos and 1,000 swarm seeds at
+random, and all 20 targeted.
+
 *Two-phase commit* (`dst bugs --system 2pc`):
 
 | Bug | Chaos | Swarm | Caught by |
@@ -205,7 +213,7 @@ two golden-hash tests pin exact runs across operating systems.
 
 | Layer | Faults |
 |---|---|
-| Network | loss, duplication, delay spikes (reordering), symmetric and one-way partitions |
+| Network | loss, duplication, delay spikes (reordering), symmetric and one-way partitions; optionally nodes in regions, each pair of regions with its own latency |
 | Nodes | crash and restart (memory and timers lost), supervisor restart after a self-halt |
 | Clocks | per-node offset and drift (up to ±5%) |
 | Disk | unsynced writes lost or partly kept on crash, torn writes, `fsync` failure (writes dropped, as on Linux), crash in the middle of `fsync`, corruption at rest (a flipped bit, or a span of bytes in the wrong place) |
@@ -230,7 +238,12 @@ always off.
 a key-value store doing `get` / `put` / `cas`:
 - *Writes* go through the log; client sessions with sequence numbers make retries exactly-once.
 - *Reads* use ReadIndex (Raft thesis §6.4): the leader confirms it still leads with one round of
-  heartbeats, then answers from its own state, without writing to the log.
+  heartbeats, then answers from its own state, without writing to the log. With optional
+  *leader leases* (`LeaseConfig`, thesis §6.4.1) it skips that round while a majority's promise
+  holds: a follower that heard from its leader within the minimum election timeout `E` (by its
+  own clock) votes for nobody, and a restarted server waits out `E` before voting. The lease runs
+  `E × (1 − ρ) / (1 + ρ)` of the leader's clock from the newest round a majority answered, where
+  `ρ` bounds clock drift.
 - *Snapshots* compact the log every 32 entries; a follower too far behind gets `InstallSnapshot`.
   The log alternates between two files and a checksummed snapshot record is the atomic switch,
   so a crash at any point leaves one complete log.

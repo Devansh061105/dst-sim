@@ -14,7 +14,7 @@ mod check;
 mod durable;
 mod wire;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::time::Duration;
@@ -171,8 +171,27 @@ pub struct RaftConfig {
     pub heartbeat: Duration,
     /// Most entries per AppendEntries message.
     pub max_batch: usize,
+    /// Leader leases (off by default): see [`LeaseConfig`].
+    pub lease: Option<LeaseConfig>,
     /// Planted bugs (all off by default).
     pub bugs: Bugs,
+}
+
+/// Leader leases: a leader answers [`Raft::read_index`] at once, without a round of heartbeats,
+/// while a majority has acknowledged it recently enough that no other leader can exist yet.
+///
+/// The promise behind it: a follower that heard from its leader less than the minimum election
+/// timeout `E` ago (by its own clock) votes for nobody, and a restarted server votes for nobody
+/// for `E` (it can't remember when it last heard from a leader). So once a majority has answered
+/// a heartbeat round sent at `t`, no other leader can be elected before each of them has seen `E`
+/// pass on its own clock after `t`. Clocks run at different rates, by up to `max_drift_ppm`
+/// each, so the leader counts its lease as `E × (1 − ρ) / (1 + ρ)` of its own clock after `t`:
+/// a leader running slow by `ρ` and a follower running fast by `ρ` then still agree. The lease
+/// is only as safe as that drift bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeaseConfig {
+    /// The most any clock runs fast or slow, in parts per million.
+    pub max_drift_ppm: u32,
 }
 
 impl RaftConfig {
@@ -183,6 +202,7 @@ impl RaftConfig {
             election_timeout: Duration::from_millis(150)..Duration::from_millis(300),
             heartbeat: Duration::from_millis(50),
             max_batch: 64,
+            lease: None,
             bugs: Bugs::default(),
         }
     }
@@ -223,6 +243,10 @@ pub struct Bugs {
     pub change_before_commit_in_term: bool,
     /// Use the latest *committed* configuration instead of the latest one in the log.
     pub use_committed_config: bool,
+    /// Size the lease as the full minimum election timeout, as if every clock ran at the same
+    /// rate: a leader with a slow clock then keeps serving reads after a follower with a fast
+    /// clock may have voted for a new leader.
+    pub lease_ignores_drift: bool,
 }
 
 /// Why [`Raft::change_membership`] refused.
@@ -268,6 +292,9 @@ pub struct Raft {
     read_round: u64,
     /// Leader only: the latest read round each peer has answered in this term.
     acked_rounds: BTreeMap<NodeId, u64>,
+    /// Leader with leases only: when each read round not yet confirmed was first sent (local
+    /// clock), plus the latest confirmed one, which the lease runs from.
+    round_sent: VecDeque<(u64, Time)>,
     reads: Vec<PendingRead>,
     /// The configuration in effect: the latest one in the log (see `refresh_members`).
     members: Vec<NodeId>,
@@ -298,6 +325,7 @@ impl Raft {
             heartbeat_timer: None,
             read_round: 0,
             acked_rounds: BTreeMap::new(),
+            round_sent: VecDeque::new(),
             reads: Vec::new(),
         }
     }
@@ -312,6 +340,11 @@ impl Raft {
         // A snapshot only ever holds committed entries; the host restores it first.
         self.commit_index = self.durable.snapshot.index;
         self.refresh_members();
+        // With leases, a restarted server may have heard from a leader just before it crashed,
+        // and it can't remember when: it waits out a whole election timeout before voting.
+        if self.config.lease.is_some() {
+            self.heard_from_leader = Some(ctx.now());
+        }
         self.reset_election_timer(ctx);
     }
 
@@ -476,6 +509,11 @@ impl Raft {
         if self.role != Role::Leader {
             return Err(NotLeader { leader: self.leader });
         }
+        // Under a lease no other leader can exist yet: nothing to confirm (round 0 always is).
+        if self.lease_until().is_some_and(|until| ctx.now() < until) {
+            self.reads.push(PendingRead { id, term: self.durable.term, round: 0 });
+            return Ok(());
+        }
         self.read_round += 1;
         self.reads.push(PendingRead { id, term: self.durable.term, round: self.read_round });
         // BUGGIFY: confirm at the next heartbeat instead of right away.
@@ -514,11 +552,16 @@ impl Raft {
         decided
     }
 
-    /// The latest read round a majority (this leader included) has answered.
+    /// The latest read round reads may count as confirmed.
     fn confirmed_round(&self) -> u64 {
         if self.config.bugs.read_without_quorum {
             return self.read_round;
         }
+        self.majority_round()
+    }
+
+    /// The latest read round a majority (this leader included) has answered.
+    fn majority_round(&self) -> u64 {
         let mut rounds: Vec<u64> =
             self.peers().iter().map(|p| self.acked_rounds.get(p).copied().unwrap_or(0)).collect();
         if self.is_member() {
@@ -526,6 +569,30 @@ impl Raft {
         }
         rounds.sort_unstable_by(|a, b| b.cmp(a));
         rounds.get(self.majority() - 1).copied().unwrap_or(0)
+    }
+
+    /// Whether this server leads under a lease at `local_now` (its own clock).
+    pub fn holds_lease(&self, local_now: Time) -> bool {
+        self.lease_until().is_some_and(|until| local_now < until)
+    }
+
+    /// Leader with leases: until when (local clock) its lease holds, if a majority has answered
+    /// one of its rounds yet. Reads arriving before then need no round of their own.
+    pub fn lease_until(&self) -> Option<Time> {
+        let lease = self.config.lease?;
+        if self.role != Role::Leader {
+            return None;
+        }
+        let confirmed = self.majority_round();
+        let &(_, sent) = self.round_sent.iter().rev().find(|&&(round, _)| round <= confirmed)?;
+        let timeout = self.config.election_timeout.start.as_nanos();
+        let length = if self.config.bugs.lease_ignores_drift {
+            timeout
+        } else {
+            let drift = u128::from(lease.max_drift_ppm);
+            timeout * (1_000_000 - drift) / (1_000_000 + drift)
+        };
+        Some(sent + Duration::from_nanos(length as u64))
     }
 
     pub fn id(&self) -> NodeId {
@@ -575,8 +642,10 @@ impl Raft {
         // is known to be alive (Raft thesis section 4.2.3). Not otherwise: our own view of the
         // configuration may be the stale one (a server just added still has the initial one),
         // and refusing to vote then can leave the cluster without a leader for good.
+        // With leases, nobody's vote requests count while a leader is alive (thesis section 6.4.1):
+        // that promise is what a lease rests on.
         if matches!(msg, RaftMsg::RequestVote { .. })
-            && !self.members.contains(&from)
+            && (self.config.lease.is_some() || !self.members.contains(&from))
             && self.leader_alive(ctx)
         {
             return Ok(());
@@ -819,8 +888,20 @@ impl Raft {
 
     /// Whether this node leads, or heard from its leader within the minimum election timeout.
     fn leader_alive(&self, ctx: &RaftContext<'_>) -> bool {
-        let lease = self.config.election_timeout.start;
-        self.role == Role::Leader || self.heard_from_leader.is_some_and(|at| ctx.now() < at + lease)
+        self.alive_at(ctx.now())
+    }
+
+    fn alive_at(&self, local_now: Time) -> bool {
+        let timeout = self.config.election_timeout.start;
+        self.role == Role::Leader
+            || self.heard_from_leader.is_some_and(|at| local_now < at + timeout)
+    }
+
+    /// With leases: whether this server would refuse a vote request at `local_now` (its own
+    /// clock), because it leads or heard from its leader within the minimum election timeout.
+    /// A lease is safe only while a majority would.
+    pub fn refuses_votes(&self, local_now: Time) -> bool {
+        self.config.lease.is_some() && self.alive_at(local_now)
     }
 
     /// A rejoining node votes again once it holds an entry from a term after the one it lost data
@@ -907,6 +988,7 @@ impl Raft {
             self.match_index.insert(peer, 0);
             self.acked_rounds.insert(peer, 0);
         }
+        self.round_sent.clear();
         // A no-op from this term: committing it also commits every earlier entry (Raft §5.4.2).
         let noop = Entry { term: self.durable.term, data: Vec::new(), config: None };
         self.durable.append(ctx.storage(), &[noop], self.sync_appends())?;
@@ -936,7 +1018,17 @@ impl Raft {
         Ok(())
     }
 
-    fn broadcast_append(&self, ctx: &mut RaftContext<'_>) {
+    fn broadcast_append(&mut self, ctx: &mut RaftContext<'_>) {
+        // With leases every broadcast is a round, so heartbeats keep the lease fresh. Rounds
+        // only grow, so a later one confirms everything an earlier one would have.
+        if self.config.lease.is_some() {
+            self.read_round += 1;
+            let confirmed = self.majority_round();
+            while self.round_sent.len() > 1 && self.round_sent[1].0 <= confirmed {
+                self.round_sent.pop_front();
+            }
+            self.round_sent.push_back((self.read_round, ctx.now()));
+        }
         for peer in self.peers() {
             self.send_append(ctx, peer);
         }

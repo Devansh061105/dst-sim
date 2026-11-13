@@ -2,7 +2,7 @@ use std::collections::btree_map::Entry as MapEntry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use sim_api::NodeId;
+use sim_api::{NodeId, Time};
 
 use crate::{Entry, Raft, Role};
 
@@ -43,11 +43,35 @@ pub enum Violation {
         index: u64,
         term: u64,
     },
+    /// Lease safety: a server held a leader lease (by its own clock) while fewer than a majority
+    /// of its configuration would refuse to vote, so a new leader could be elected under it.
+    LeaseUnbacked {
+        holder: NodeId,
+        term: u64,
+        refusing: usize,
+        members: usize,
+    },
+    /// Lease safety: a server still held a leader lease (by its own clock) while another server
+    /// already led a later term, so both could answer reads.
+    OverlappingLeases {
+        holder: NodeId,
+        term: u64,
+        newer: NodeId,
+        newer_term: u64,
+    },
 }
 
 impl fmt::Display for Violation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Violation::LeaseUnbacked { holder, term, refusing, members } => write!(
+                f,
+                "lease safety: {holder} held its lease of term {term} while only {refusing} of its                  {members} members would refuse to vote for someone else"
+            ),
+            Violation::OverlappingLeases { holder, term, newer, newer_term } => write!(
+                f,
+                "lease safety: {holder} still held its lease of term {term} while {newer} led                  term {newer_term}"
+            ),
             Violation::TwoLeaders { term, first, second } => {
                 write!(f, "election safety: {first} and {second} both led term {term}")
             }
@@ -119,6 +143,58 @@ impl Checker {
         nodes: impl IntoIterator<Item = &'a Raft>,
     ) -> Result<(), Violation> {
         nodes.into_iter().try_for_each(|raft| self.check_node(raft))
+    }
+
+    /// Lease safety, at one instant. A lease rests on a promise: while a leader holds one, a
+    /// majority of its configuration would refuse to vote for anyone else, so no other leader
+    /// can be elected. This checks the promise itself (a new leader *could* be elected), not just
+    /// its symptom (one *was*), so an unsafe lease is caught whether or not an election happens
+    /// to win the race. Each server comes with its own clock's reading, or `None` while it is
+    /// down: a down server votes for nobody, and with leases it refuses for an election timeout
+    /// after it restarts. (Stateless: what matters is only the present.)
+    pub fn check_leases<'a>(
+        nodes: impl IntoIterator<Item = (&'a Raft, Option<Time>)>,
+    ) -> Result<(), Violation> {
+        let nodes: Vec<(&Raft, Option<Time>)> = nodes.into_iter().collect();
+        for &(holder, local_now) in &nodes {
+            if !local_now.is_some_and(|now| holder.holds_lease(now)) {
+                continue;
+            }
+            let members = holder.members();
+            let refusing = members
+                .iter()
+                .filter(|&&m| {
+                    nodes
+                        .iter()
+                        .find(|(raft, _)| raft.id() == m)
+                        .is_none_or(|&(raft, at)| at.is_none_or(|at| raft.refuses_votes(at)))
+                })
+                .count();
+            if refusing < members.len() / 2 + 1 {
+                return Err(Violation::LeaseUnbacked {
+                    holder: holder.id(),
+                    term: holder.term(),
+                    refusing,
+                    members: members.len(),
+                });
+            }
+        }
+        let newest = nodes
+            .iter()
+            .filter(|(raft, at)| at.is_some() && raft.role() == Role::Leader)
+            .max_by_key(|(raft, _)| raft.term());
+        let Some(&(newest, _)) = newest else { return Ok(()) };
+        for &(raft, local_now) in &nodes {
+            if raft.term() < newest.term() && local_now.is_some_and(|now| raft.holds_lease(now)) {
+                return Err(Violation::OverlappingLeases {
+                    holder: raft.id(),
+                    term: raft.term(),
+                    newer: newest.id(),
+                    newer_term: newest.term(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The entries known to be committed, in order.

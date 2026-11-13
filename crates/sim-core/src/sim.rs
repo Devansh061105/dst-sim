@@ -481,6 +481,12 @@ impl<N: Node> Simulation<N> {
         self.now
     }
 
+    /// What node `id`'s own (drifting) clock reads now. For checks that compare what nodes
+    /// believe about time, such as leases; nodes themselves only ever see this, never `now`.
+    pub fn local_time(&self, id: NodeId) -> Time {
+        self.clocks[id.0 as usize].local(self.now)
+    }
+
     pub fn is_up(&self, id: NodeId) -> bool {
         self.up[id.0 as usize]
     }

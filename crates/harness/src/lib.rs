@@ -20,7 +20,7 @@ use raft::{Checker, Violation};
 pub use scenario::{Knob, Scenario};
 pub use shrink::{Shrunk, shrink};
 use sim_api::{NodeId, Time};
-use sim_core::{Script, SimConfig, Simulation, Stats, TraceEvent};
+use sim_core::{Fault, Script, SimConfig, Simulation, Stats, TraceEvent};
 
 /// Raft servers in the standard cluster.
 pub const SERVERS: u32 = 5;
@@ -381,6 +381,34 @@ pub fn run_cluster(config: SimConfig, servers: u32, ops_per_client: u32, bugs: B
     run(config, servers, ops_per_client, bugs, false)
 }
 
+/// [`run_cluster`] with leader leases: reads skip their round of heartbeats while the leader's
+/// lease holds (see [`raft::LeaseConfig`]).
+pub fn run_cluster_with_lease(
+    config: SimConfig,
+    servers: u32,
+    ops_per_client: u32,
+    bugs: Bugs,
+    lease: raft::LeaseConfig,
+) -> Outcome {
+    let nodes = kv::cluster_with_lease(servers, ops_per_client, bugs, Some(lease));
+    run_nodes(config, nodes, false)
+}
+
+/// [`run_cluster_with_lease`], with `script` choosing faults as the run goes: it sees the
+/// simulation after every step and returns faults to inject right away. Targeted scenarios use
+/// it to cut off whichever server leads at the moment.
+pub fn run_scripted_with_lease(
+    config: SimConfig,
+    servers: u32,
+    ops_per_client: u32,
+    bugs: Bugs,
+    lease: raft::LeaseConfig,
+    script: impl FnMut(&Simulation<kv::KvNode>) -> Vec<Fault>,
+) -> Outcome {
+    let nodes = kv::cluster_with_lease(servers, ops_per_client, bugs, Some(lease));
+    run_nodes_scripted(config, nodes, false, script)
+}
+
 /// [`run_cluster`], also recording the abstract states the cluster passes through.
 pub fn run_cluster_with_coverage(
     config: SimConfig,
@@ -420,6 +448,15 @@ fn run_nodes(
     nodes: impl FnMut(NodeId) -> kv::KvNode + 'static,
     coverage: bool,
 ) -> Outcome {
+    run_nodes_scripted(config, nodes, coverage, |_| Vec::new())
+}
+
+fn run_nodes_scripted(
+    config: SimConfig,
+    nodes: impl FnMut(NodeId) -> kv::KvNode + 'static,
+    coverage: bool,
+    mut script: impl FnMut(&Simulation<kv::KvNode>) -> Vec<Fault>,
+) -> Outcome {
     let seed = config.seed;
     let mut states = BTreeSet::new();
     let mut sim = Simulation::new(config, nodes);
@@ -433,6 +470,9 @@ fn run_nodes(
     let mut false_alarm = None;
     let mut clients_done = false;
     while sim.step().is_none() {
+        for fault in script(&sim) {
+            sim.inject(fault);
+        }
         // Drain after every step so the history's order matches real time.
         let now = sim.now();
         for &client in &clients {
@@ -460,6 +500,13 @@ fn run_nodes(
         let running = sim.nodes().filter(|&(id, _)| sim.is_up(id));
         if let Err(v) = checker.check(running.filter_map(|(_, n)| n.as_server()).map(Server::raft))
         {
+            violation = Some(v);
+            break;
+        }
+        let leases = sim.nodes().filter_map(|(id, n)| {
+            Some((n.as_server()?.raft(), sim.is_up(id).then(|| sim.local_time(id))))
+        });
+        if let Err(v) = Checker::check_leases(leases) {
             violation = Some(v);
             break;
         }

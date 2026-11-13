@@ -157,10 +157,20 @@ pub fn cluster_with_bugs(
     ops_per_client: u32,
     bugs: Bugs,
 ) -> impl FnMut(NodeId) -> KvNode + 'static {
+    cluster_with_lease(servers, ops_per_client, bugs, None)
+}
+
+/// Like [`cluster_with_bugs`], with leader leases (see [`raft::LeaseConfig`]) if `lease` is set.
+pub fn cluster_with_lease(
+    servers: u32,
+    ops_per_client: u32,
+    bugs: Bugs,
+    lease: Option<raft::LeaseConfig>,
+) -> impl FnMut(NodeId) -> KvNode + 'static {
     let members: Vec<NodeId> = (0..servers).map(NodeId).collect();
     move |id| {
         if id.0 < servers {
-            KvNode::Server(Server::with_bugs(id, members.clone(), bugs))
+            KvNode::Server(Server::with_lease(id, members.clone(), bugs, lease))
         } else {
             KvNode::Client(Client::new(members.clone(), ops_per_client))
         }

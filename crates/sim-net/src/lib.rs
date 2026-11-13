@@ -1,4 +1,5 @@
-//! Simulated network with fault injection: latency, drop, duplicate, reorder and partitions.
+//! Simulated network with fault injection: latency, drop, duplicate, reorder and partitions,
+//! optionally with nodes in regions whose links have their own latency.
 //!
 //! [`Network`] is a pure model: given a message's endpoints and a source of randomness, it decides
 //! the message's fate as a [`Route`]. It holds no clock and no queue; the simulator turns a route
@@ -28,6 +29,31 @@ pub struct NetConfig {
     pub spike: f64,
     /// Delay of a message that hits a spike.
     pub spike_latency: Range<Duration>,
+    /// Nodes placed in regions, each pair of regions with its own normal delay instead of
+    /// `latency` (off by default: one latency for every link).
+    pub regions: Option<Regions>,
+}
+
+/// Where nodes are and how far apart: a latency matrix by region.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Regions {
+    /// The region of each node, indexed by node id. Nodes past the end are in region 0.
+    pub of: Vec<usize>,
+    /// The normal one-way delay from region `a` to region `b` is drawn from `latency[a][b]`
+    /// (`latency[a][a]`: within region `a`).
+    pub latency: Vec<Vec<Range<Duration>>>,
+}
+
+impl Regions {
+    /// The region of `node`.
+    pub fn region(&self, node: NodeId) -> usize {
+        self.of.get(node.0 as usize).copied().unwrap_or(0)
+    }
+
+    /// The normal delay range of the link from `from` to `to`.
+    pub fn latency(&self, from: NodeId, to: NodeId) -> Range<Duration> {
+        self.latency[self.region(from)][self.region(to)].clone()
+    }
 }
 
 impl Default for NetConfig {
@@ -39,6 +65,7 @@ impl Default for NetConfig {
             duplicate: 0.0,
             spike: 0.0,
             spike_latency: Duration::from_millis(100)..Duration::from_secs(1),
+            regions: None,
         }
     }
 }
@@ -65,6 +92,14 @@ impl Network {
         for p in [config.drop, config.duplicate, config.spike] {
             assert!((0.0..=1.0).contains(&p), "probability {p} is outside [0, 1]");
         }
+        if let Some(regions) = &config.regions {
+            let n = regions.latency.len();
+            assert!(
+                regions.latency.iter().all(|row| row.len() == n),
+                "latency matrix is not square"
+            );
+            assert!(regions.of.iter().all(|&r| r < n), "a node is in a region the matrix lacks");
+        }
         Network { config, blocked: BTreeSet::new() }
     }
 
@@ -83,17 +118,19 @@ impl Network {
         if rand.chance(self.config.drop) {
             return Route::Lost;
         }
-        let first = self.delay(rand);
+        let first = self.delay(from, to, rand);
         if rand.chance(self.config.duplicate) {
-            Route::Duplicate(first, self.delay(rand))
+            Route::Duplicate(first, self.delay(from, to, rand))
         } else {
             Route::Deliver(first)
         }
     }
 
-    fn delay(&self, rand: &mut impl Rand) -> Duration {
+    fn delay(&self, from: NodeId, to: NodeId, rand: &mut impl Rand) -> Duration {
         if rand.chance(self.config.spike) {
             rand.duration_in(self.config.spike_latency.clone())
+        } else if let Some(regions) = &self.config.regions {
+            rand.duration_in(regions.latency(from, to))
         } else {
             rand.duration_in(self.config.latency.clone())
         }
@@ -176,6 +213,26 @@ mod tests {
 
         let dup = Network::new(NetConfig { duplicate: 1.0, ..NetConfig::default() });
         assert!(matches!(dup.route(A, B, &mut Lcg(1)), Route::Duplicate(..)));
+    }
+
+    #[test]
+    fn regions_set_each_links_latency() {
+        let ms = Duration::from_millis;
+        let regions = Regions {
+            of: vec![0, 0, 1],
+            latency: vec![vec![ms(1)..ms(2), ms(40)..ms(50)], vec![ms(40)..ms(50), ms(1)..ms(2)]],
+        };
+        let net = Network::new(NetConfig { regions: Some(regions), ..NetConfig::default() });
+        let mut rand = Lcg(9);
+        for _ in 0..100 {
+            let near = net.route(NodeId(0), NodeId(1), &mut rand);
+            let far = net.route(NodeId(1), NodeId(2), &mut rand);
+            // A node past the end of `of` is in region 0.
+            let unplaced = net.route(NodeId(7), NodeId(0), &mut rand);
+            assert!(matches!(near, Route::Deliver(d) if d < ms(2)), "{near:?}");
+            assert!(matches!(far, Route::Deliver(d) if d >= ms(40)), "{far:?}");
+            assert!(matches!(unplaced, Route::Deliver(d) if d < ms(2)), "{unplaced:?}");
+        }
     }
 
     #[test]

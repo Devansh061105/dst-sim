@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use raft::{Applied, ChangeError, NotLeader, Raft, RaftConfig, RaftMsg, RaftTimer, ReadOutcome};
+use raft::{
+    Applied, ChangeError, LeaseConfig, NotLeader, Raft, RaftConfig, RaftMsg, RaftTimer, ReadOutcome,
+};
 use sim_api::{NodeId, SubContext, TimerId};
 
 use crate::command::{Command, Op, OpResult, RequestId, Sessions, decode_state, encode_state};
@@ -40,8 +42,20 @@ impl Server {
 
     /// A server with deliberately planted bugs, for checking that the tests catch them.
     pub fn with_bugs(id: NodeId, members: Vec<NodeId>, bugs: Bugs) -> Self {
+        Self::with_lease(id, members, bugs, None)
+    }
+
+    /// A server whose Raft uses leader leases (see [`LeaseConfig`]), so reads skip the round of
+    /// heartbeats while the lease holds.
+    pub fn with_lease(
+        id: NodeId,
+        members: Vec<NodeId>,
+        bugs: Bugs,
+        lease: Option<LeaseConfig>,
+    ) -> Self {
+        let config = RaftConfig { bugs: bugs.raft, lease, ..RaftConfig::new(members) };
         Server {
-            raft: Raft::new(id, RaftConfig { bugs: bugs.raft, ..RaftConfig::new(members) }),
+            raft: Raft::new(id, config),
             store: BTreeMap::new(),
             sessions: BTreeMap::new(),
             pending: BTreeMap::new(),
